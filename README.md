@@ -39,8 +39,8 @@ If you've ever needed to:
 
 ```
 # Clone the repository
-git clone https://github.com/waqasdaar/iperf3-traffic-manager.git
-cd iperf3-traffic-manager
+git clone https://github.com/waqasdaar/iperf3-traffic-streams.git
+cd iperf3-traffic-streams
 
 # Make executable
 chmod +x iperf3_manager.sh
