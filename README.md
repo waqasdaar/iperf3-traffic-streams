@@ -43,10 +43,12 @@ git clone https://github.com/waqasdaar/iperf3-traffic-streams.git
 cd iperf3-traffic-streams
 
 # Make executable
-chmod +x iperf3_manager.sh
+chmod +x iperf3-traffic-flows.sh
 
 # Run (sudo recommended for VRF/DSCP/netem features)
-sudo ./iperf3_manager.sh
+sudo ./iperf3-traffic-flows.sh
+OR
+sudo bash sudo ./iperf3-traffic-flows.sh
 ```
 ### Use Case 1: Basic Bandwidth Testing (Single Stream)
 
