@@ -769,6 +769,8 @@ Stream 2 - DSCP (name/0-63/'list'/Enter=none) [none]: AF41
 Stream 3 - DSCP (name/0-63/'list'/Enter=none) [none]: 46
 ```
 Numeric entry also accepted, equivalent to EF
+
+
 **Multi-Class QoS Validation Dashboard**
 ```
 +==============================================================================+
@@ -785,4 +787,79 @@ Numeric entry also accepted, equivalent to EF
 |  Ctrl+C to stop all streams                                                  |
 +------------------------------------------------------------------------------+
 ```
+## Use Case 7 — TCP Tuning and CCA Comparison
+
+**Goal**: Benchmark the impact of different TCP congestion control algorithms, receive window sizes, and MSS values on throughput and retransmissions.
+Typical scenarios:
+- Comparing BBR vs CUBIC over a WAN path
+- Tuning buffer sizes for high-latency links
+- MSS optimization for VPN or tunnelled paths
+- Pre-deployment CCA selection
+
+**Configuration — BBR vs CUBIC**
+```
+Protocol: TCP
+Target:   10.0.0.1
+Port:     5201
+Duration: 60
+
+-- TCP Options --
+Available CCAs: bbr cubic reno
+CCA [kernel default]: bbr
+Window size: 256K
+MSS: 1460
+```
+
+**Stream 2 — CUBIC:**
+```
+Protocol: TCP
+Target:   10.0.0.1
+Port:     5202
+Duration: 60
+
+-- TCP Options --
+CCA [kernel default]: cubic
+Window size: 256K
+MSS: 1460
+```
+**Generated Commands**
+```
+# Stream 1 — BBR
+iperf3 -c 10.0.0.1 -p 5201 -t 60 -i 1 -C bbr -w 256K -M 1460
+
+# Stream 2 — CUBIC
+iperf3 -c 10.0.0.1 -p 5202 -t 60 -i 1 -C cubic -w 256K -M 1460
+```
+
+**Live Dashboard**
+
+```
++==============================================================================+
+|                   iperf3 Traffic Manager -- Live Dashboard                   |
++==============================================================================+
+|  Active:2   Connected:2   Done:0   Failed:0   Elapsed:00:20                  |
++------------------------------------------------------------------------------+
+|  #    Proto  Target         Port   Bandwidth    Time    DSCP   Status        |
++------------------------------------------------------------------------------+
+|  1    TCP    10.0.0.1       5201   948.12 Mbps  00:40   ---    CONNECTED     |
+|  2    TCP    10.0.0.1       5202   931.44 Mbps  00:40   ---    CONNECTED     |
++------------------------------------------------------------------------------+
+|  Ctrl+C to stop all streams                                                  |
++------------------------------------------------------------------------------+
+```
+**Final Results**
+```
++==============================================================================+
+|                                Final Results                                 |
++==============================================================================+
+
+  #    Proto  Target      Port   Sender BW     Receiver BW   Retx
+  ------------------------------------------------------------------
+  1    TCP    10.0.0.1    5201   948.12 Mbps   945.33 Mbps   Retx:1
+  2    TCP    10.0.0.1    5202   931.44 Mbps   929.11 Mbps   Retx:8
+  ------------------------------------------------------------------
+
+  All 2 stream(s) completed successfully.
+```
+BBR achieved higher throughput with fewer retransmissions, suggesting better behavior under buffer congestion on this path.
 
