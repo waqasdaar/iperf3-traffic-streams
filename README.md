@@ -212,7 +212,54 @@ iperf3 --version
 ```
 ## Step 2 — Get the Script
 ```
-git clone https://github.com/your-org/iperf3-manager.git
-cd iperf3-manager
+git clone https://github.com/waqasdaar/iperf3-traffic-streams.git
+cd iperf3-traffic-streams
 ```
+## Step 3 — Set Execute Permission
+```
+chmod +x iperf3-traffic-streams.sh
+```
+## Step 4 — Optional System-Wide Installation
+```
+sudo cp iperf3_manager.sh /usr/local/bin/iperf3-traffic-streams.sh
+sudo chmod +x /usr/local/bin/iperf3-traffic-streams.sh
+```
+## Step 5 — Verify Everything Is Ready
+```
+# Check bash version (must be 4.0 or later)
+bash --version
 
+# Check iperf3
+iperf3 --version
+
+# Check iproute2
+ip -V
+ss --version
+
+# Run the script
+sudo ./iperf3-traffic-streams.sh
+```
+**Expected Launch Screen**
+
+```
++==============================================================================+
+|                                                                              |
+|             iperf3 Multi-Stream Traffic Manager  v7.7                        |
+|                                                                              |
++==============================================================================+
+|  iperf3 3.9   at /usr/bin/iperf3                                             |
+|  Running as: root  (full feature access)                                     |
+|                                                                              |
++------------------------------------------------------------------------------+
+|                                                                              |
+|   1   Interface Table                                                        |
+|   2   Server Mode   --  start iperf3 listener(s)                             |
+|   3   Client Mode   --  generate traffic stream(s)                           |
+|   4   Loopback Test --  local server + client validation                     |
+|   5   DSCP Reference Table                                                   |
+|   6   Exit                                                                   |
+|                                                                              |
++==============================================================================+
+
+  Select [1-6]:
+```
