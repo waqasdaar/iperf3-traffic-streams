@@ -589,3 +589,63 @@ Launch 3 stream(s)? [Y/n]: Y
 
   All 3 stream(s) completed successfully.
 ```
+
+## Use Case 4 — Server Mode with Multiple Listeners
+**Goal**: Start multiple iperf3 listeners on different ports, bind addresses, and VRFs in a single operation.
+Typical scenarios:
+- Receiving traffic from multiple clients simultaneously
+- Testing multiple VRF paths from a single host
+- Pre-positioning listeners before a test window
+
+**Configuration — 2 Listeners**
+| Listener | Port | Bind IP         |
+|----------|------|-----------------|
+| 1        | 5201 | 192.168.114.200 |
+| 2        | 5202 | 10.10.114.3     |
+
+**Running the Test**
+```
+Select [1-6]: 2
+Selection [0]: 0
+How many listeners? [1]: 2
+
+── Listener 1 of 2 ──
+Listen port [5201]: 5201
+Bind IP: 192.168.114.200
+VRF: Enter
+One-off mode? [no]: n
+
+── Listener 2 of 2 ──
+Listen port [5202]: 5202
+Bind IP: 10.10.114.3
+VRF: vrf10
+One-off mode? [no]: n
+
+Launch 2 listener(s)? [Y/n]: Y
+
+[STARTED]  server 1  PID 967934  port 5201
+[STARTED]  server 2  PID 967935  port 5202
+
+  Waiting for servers to start listening...
+  [READY  ]  server 1  port 5201
+  [READY  ]  server 2  port 5202
+
+  Servers running. Opening dashboard...
+
+```
+**Server Dashboard (Clients Connected)**
+
+```
++==============================================================================+
+|                  iperf3 Traffic Manager -- Server Dashboard                  |
++==============================================================================+
+|  Listeners active: 2 / 2                                                     |
++------------------------------------------------------------------------------+
+|  #    Port    Bind IP            VRF         Bandwidth      Status           |
++------------------------------------------------------------------------------+
+|  1    5201    192.168.114.200    GRT          938.21 Mbps   CONNECTED        |
+|  2    5202    10.10.114.3        vrf10         88.10 Mbps   CONNECTED        |
++------------------------------------------------------------------------------+
+|  Ctrl+C to stop all listeners                                                |
++------------------------------------------------------------------------------+
+```
