@@ -649,3 +649,67 @@ Launch 2 listener(s)? [Y/n]: Y
 |  Ctrl+C to stop all listeners                                                |
 +------------------------------------------------------------------------------+
 ```
+## Use Case 5 — VRF-Aware Testing
+
+**Goal**: Run iperf3 client and server processes within a specific Linux VRF instance to validate VRF-specific routing and connectivity.
+Typical scenarios:
+- MPLS / L3VPN tenant path validation
+- Network segmentation verification
+- VRF routing policy testing
+- Multi-tenant connectivity validation
+__The script automatically__:
+- Discovers all configured VRFs via ip vrf show
+- Maps each interface to its VRF via ip link show master
+- Displays VRF membership in the interface table
+- Injects ip vrf exec <vrf> before the iperf3 command
+
+**Interface Table Showing VRF Layout**
+```
++----+---------------+--------------------+----------+----------+--------------+
+|  # | Interface     | IP Address         | State    | Speed    | VRF          |
++----+---------------+--------------------+----------+----------+--------------+
+| [ GRT -- Global Routing Table ]  (1 interface(s))                            |
++----+---------------+--------------------+----------+----------+--------------+
+|  1 | eth0          | 192.168.1.100      | up       | 1000Mb/s | GRT          |
++----+---------------+--------------------+----------+----------+--------------+
+| [ VRF: vrf10 ]  (2 interface(s))                                             |
++----+---------------+--------------------+----------+----------+--------------+
+|  2 | eth1          | 10.10.114.3        | up       | 1000Mb/s | vrf10        |
+|  3 | eth2          | 10.10.115.3        | up       | 1000Mb/s | vrf10        |
++----+---------------+--------------------+----------+----------+--------------+
+```
+**VRF Server Configuration**
+```
+Listen port [5201]: 5201
+Bind IP: 10.10.114.3
+VRF (press Enter for GRT/none): vrf10
+```
+**Generated command:**
+```
+ip vrf exec vrf10 iperf3 -s -p 5201 -B 10.10.114.3 -i 1
+```
+**VRF Client Configuration**
+```
+Target server IP/hostname: 10.10.114.1
+VRF (press Enter for GRT/none): vrf10
+```
+**Generated command:**
+```
+ip vrf exec vrf10 iperf3 -c 10.10.114.1 -p 5201 -t 30 -i 1
+```
+
+**VRF Server Dashboard**
+```
++==============================================================================+
+|                  iperf3 Traffic Manager -- Server Dashboard                  |
++==============================================================================+
+|  Listeners active: 2 / 2                                                     |
++------------------------------------------------------------------------------+
+|  #    Port    Bind IP           VRF         Bandwidth      Status            |
++------------------------------------------------------------------------------+
+|  1    5201    10.10.114.3       vrf10        941.20 Mbps   CONNECTED         |
+|  2    5202    10.10.115.3       vrf10        880.44 Mbps   CONNECTED         |
++------------------------------------------------------------------------------+
+|  Ctrl+C to stop all listeners                                                |
++------------------------------------------------------------------------------+
+```
