@@ -980,7 +980,227 @@ Reverse mode -R? [no]: y
   All 2 stream(s) completed successfully.
 ```
 
-**<font color="blue">Stream 1 (forward) shows full 950 Mbps.</font>**
+**Stream 1 (forward) shows full 950 Mbps.**
 
-**<font color="blue">Stream 2 (reverse) shows only 480 Mbps.</font> — <font color="red">confirming upstream asymmetry.</font>**
+**Stream 2 (reverse) shows only 480 Mbps. confirming upstream asymmetry.**
 
+## Use Case 10 — Loopback Local Validation
+
+**Goal**: Verify that iperf3 is working correctly and measure local kernel TCP/UDP stack performance without requiring a second host.
+
+
+Typical scenarios:
+- Post-install smoke test
+- Lab host validation
+- Confirming tool functionality before remote testing
+
+**Configuration**
+```
+Select [1-6]: 4
+How many loopback streams? [1]: 1
+
+Stream 1:
+Protocol: TCP
+Bandwidth: Enter
+Duration: 10
+DSCP: Enter
+
+Launch loopback test? [Y/n]: Y
+
+[STARTED]  server 1  PID 33200  port 5201
+[READY  ]  server 1  port 5201
+[STARTED]  stream 1  PID 33210  TCP -> 127.0.0.1:5201
+
+  Running. Opening dashboard...
+
+```
+
+**Live Dashboard**
+```
++==============================================================================+
+|                   iperf3 Traffic Manager -- Live Dashboard                   |
++==============================================================================+
+|  Active:1   Connected:1   Done:0   Failed:0   Elapsed:00:05                  |
++------------------------------------------------------------------------------+
+|  #    Proto  Target         Port   Bandwidth    Time    DSCP   Status        |
++------------------------------------------------------------------------------+
+|  1    TCP    127.0.0.1      5201   24.81 Gbps   00:05   ---    CONNECTED     |
++------------------------------------------------------------------------------+
+|  Ctrl+C to stop all streams                                                  |
++------------------------------------------------------------------------------+
+```
+
+**Final Results**
+```
++==============================================================================+
+|                                Final Results                                 |
++==============================================================================+
+
+  #    Proto  Target       Port   Sender BW     Receiver BW   Retx
+  ------------------------------------------------------------------
+  1    TCP    127.0.0.1    5201   24.81 Gbps    24.79 Gbps    Retx:0
+  ------------------------------------------------------------------
+
+  All 1 stream(s) completed successfully.
+```
+
+Loopback throughput of 20–40 Gbps is normal on modern Linux hardware. 
+Values significantly below this may indicate kernel or CPU bottlenecks.
+
+## Dashboard Reference
+
+**Client Dashboard Column Definitions**
+
+
+| Column    | Width | Description                                |
+|-----------|-------|--------------------------------------------|
+| #         | 3     | Stream index number                        |
+| Proto     | 5     | TCP or UDP                                 |
+| Target    | 13    | Destination IP, truncated with ~ if longer |
+| Port      | 5     | Destination port number                    |
+| Bandwidth | 11    | Current 1-second interval throughput       |
+| Time      | 6     | Remaining duration or inf for unlimited    |
+| DSCP      | 5     | DSCP name or numeric value, --- if not set |
+| Status    | 9     | Current stream state                       |
+
+
+**Server Dashboard Column Definitions**
+
+| Column    | Width | Description                                   |
+|-----------|-------|-----------------------------------------------|
+| #         | 3     | Listener index number                         |
+| Port      | 6     | Listening port number                         |
+| Bind IP   | 16    | Bound address, 0.0.0.0 means all interfaces   |
+| VRF       | 10    | VRF name or GRT for global routing table      |
+| Bandwidth | 12    | Live receive throughput from connected client |
+| Status    | 9     | Current listener state                        |
+
+**Status Reference**
+
+| Status     | Side            | Meaning                                   |
+|------------|-----------------|-------------------------------------------|
+| STARTING   | Client / Server | Process launched, no log output yet       |
+| CONNECTING | Client          | Log file exists, no interval data yet     |
+| CONNECTED  | Client / Server | Active data transfer confirmed            |
+| LISTENING  | Server          | Port open and accepting connections       |
+| RUNNING    | Server          | Client connected and transfer in progress |
+| DONE       | Client / Server | Stream or listener exited normally        |
+| FAILED     | Client          | Error detected — check error panel        |
+
+## DSCP Reference Table
+
+| Name          | DSCP | TOS | Typical Use Case                    |
+|---------------|------|-----|-------------------------------------|
+| Default / CS0 | 0    | 0   | Best Effort                         |
+| CS1           | 8    | 32  | Scavenger / Low-priority bulk       |
+| AF11          | 10   | 40  | Low data — assured, low drop        |
+| AF12          | 12   | 48  | Low data — assured, med drop        |
+| AF13          | 14   | 56  | Low data — assured, high drop       |
+| CS2           | 16   | 64  | OAM / Network management            |
+| AF21          | 18   | 72  | High-throughput data — low drop     |
+| AF22          | 20   | 80  | High-throughput data — med drop     |
+| AF23          | 22   | 88  | High-throughput data — high drop    |
+| CS3           | 24   | 96  | Broadcast video / Signaling         |
+| AF31          | 26   | 104 | Multimedia streaming — low drop     |
+| AF32          | 28   | 112 | Multimedia streaming — med drop     |
+| AF33          | 30   | 120 | Multimedia streaming — high drop    |
+| CS4           | 32   | 128 | Real-time interactive               |
+| AF41          | 34   | 136 | Multimedia conferencing — low drop  |
+| AF42          | 36   | 144 | Multimedia conferencing — med drop  |
+| AF43          | 38   | 152 | Multimedia conferencing — high drop |
+| CS5           | 40   | 160 | Signaling — call control            |
+| VA            | 44   | 176 | Voice Admit — CAC admitted          |
+| EF            | 46   | 184 | Expedited Forwarding — VoIP         |
+| CS6           | 48   | 192 | Network Control — BGP / OSPF        |
+| CS7           | 56   | 224 | Reserved / Network Critical         |
+
+**Formula**: TOS = DSCP × 4
+
+## Output and Log Files
+
+_Temporary Directory Structure_
+
+```
+/tmp/iperf3_mgr.XXXXXX/
+├── stream_1.sh          Generated iperf3 client launch script
+├── stream_1.log         Plain-text iperf3 output for stream 1
+├── stream_2.sh
+├── stream_2.log
+├── server_1.sh          Generated iperf3 server launch script
+├── server_1.log         Plain-text iperf3 server output
+└── server_2.log
+```
+
+**Sample Raw Client Log**
+
+```
+Connecting to host 192.168.1.10, port 5201
+[  5] local 192.168.1.20 port 54321 connected to 192.168.1.10 port 5201
+[ ID] Interval           Transfer     Bitrate         Retr  Cwnd
+[  5]   0.00-1.00   sec   112 MBytes   939 Mbits/sec    0   1.50 MBytes
+[  5]   1.00-2.00   sec   113 MBytes   947 Mbits/sec    0   1.50 MBytes
+[  5]   2.00-3.00   sec   112 MBytes   940 Mbits/sec    1   1.49 MBytes
+[  5]   3.00-4.00   sec   113 MBytes   948 Mbits/sec    0   1.51 MBytes
+...
+[  5]   0.00-30.00  sec  3.29 GBytes   942 Mbits/sec    2   sender
+[  5]   0.00-30.00  sec  3.28 GBytes   939 Mbits/sec        receiver
+```
+
+**Interactive Log Viewer**
+After a test completes, the script prompts:
+```
+View raw log for stream # (or press Enter/q to quit): 1
+```
+
+## Cleanup and Signal Handling
+
+**Signals Handled**
+
+| Signal  | Trigger         | Exit Code                        |
+|---------|-----------------|----------------------------------|
+| SIGINT  | Ctrl+C          | 130                              |
+| SIGTERM | kill <pid>      | 143                              |
+| SIGQUIT | Ctrl+\          | 131                              |
+| SIGHUP  | Terminal closed | 129                              |
+| SIGTSTP | Ctrl+Z          | blocked — warning shown          |
+| EXIT    | Any exit path   | runs cleanup if not already done |
+
+**Cleanup Actions Performed**
+
+```
+1. Terminate all running client stream processes
+2. Terminate all running server listener processes
+3. Remove all tc netem qdiscs that were applied
+4. Delete all generated launch scripts
+5. Delete all temporary log files
+6. Remove the temporary working directory
+```
+
+**Example Cleanup Output**
+```
+[SIGINT]  Ctrl+C -- stopping...
+
++===========================================================================+
+  iperf3 Manager -- Cleanup  [signal: SIGINT (Ctrl+C)]
++===========================================================================+
+
+  Client Streams:
+    [STOP  ]  PID 12345  stream 1 [TCP->192.168.1.10:5201]
+    [DONE  ]  PID 12346  stream 2 [UDP->10.10.10.5:5201]  (already exited)
+
+  Server Listeners:
+    [STOP  ]  PID 22100  listener 1 [port 5201 bind 0.0.0.0]
+
+  tc netem:
+    [REMOVED]  netem on eth0
+
+  Temporary Files:
+    [DEL]  /tmp/iperf3_mgr.abcd12/stream_1.log  (14823 bytes)
+    [DEL]  /tmp/iperf3_mgr.abcd12/stream_1.sh   (128 bytes)
+    [REMOVED]  /tmp/iperf3_mgr.abcd12
+
+  Processes stopped : 2
+  Already exited    : 1
+  Cleanup complete. All resources released.
+
+```
