@@ -440,6 +440,7 @@ Typical scenarios:
 - Video streaming path validation
 - QoS policy verification
 - Pre/post impairment comparison
+
 **Important**: iperf3 requires an explicit bandwidth value for UDP. Without it the default is 1 Mbps, which may not reflect real traffic.
 
 **Configuration**
