@@ -103,3 +103,116 @@ The script builds a complete orchestration layer around `iperf3`:
 │ 10. Clean up all processes and tc rules on exit                     │
 └─────────────────────────────────────────────────────────────────────┘
 ```
+### Why Plain Text Output Instead of JSON
+
+`iperf3 -J` (JSON mode) buffers all output until the process exits.
+This makes it useless for real-time display. The script uses plain-text
+output and parses interval lines using `grep` and `awk` anchored on the
+`bits/sec` token, which works identically for both TCP and UDP output.
+
+### How the Dashboard Avoids Scrolling
+
+- **Step 1** Print N blank lines Forces terminal to scroll
+       Reserves N lines of viewport space
+- **Step 2** Move cursor up N rows printf '\033[%dA' N
+- **Step 3** Overwrite frame in place Renders over the blank lines
+- **Step 4** Sleep 1 second
+- **Step 5** Repeat from Step 2
+
+This technique works reliably across SSH sessions, `tmux`, `screen`, and
+all standard terminal emulators.
+
+### How Connection Status Is Detected
+
+Status detection uses three layers in priority order:
+
+- **Layer 1** /proc/<pid>/net/tcp TCP ESTABLISHED via hex IP:port match
+              /proc/<pid>/net/udp UDP socket presence
+- **Layer 2** ss -tn / ss -un Socket state via iproute2
+- **Layer 3** Log interval-line grep Pattern: [ N] X.X-Y.Y sec.*bits
+
+Presence confirms active transfer
+
+---
+
+## Requirements
+
+### Mandatory
+
+| Component | Minimum | Notes |
+|---|---|---|
+| Operating System | Linux | Required for VRF and `/proc` features |
+| `bash` | 4.0 | Associative arrays and modern expansions required |
+| `iperf3` | 3.0 | Core measurement engine |
+| `iproute2` | any | Provides `ip`, `ss`, and `tc` |
+| `awk` | any | Bandwidth parsing and unit conversion |
+| `grep` | any | Log scanning |
+| `coreutils` | any | `mktemp`, `date`, `rm`, `cat`, `wc` |
+
+### Optional
+
+| Component | Purpose | Missing Impact |
+|---|---|---|
+| `tc` from `iproute2` | Network impairment via `tc netem` | Netem prompts shown but skipped |
+| `ethtool` | Interface speed detection fallback | Speed reported as `N/A` |
+| Root / `sudo` | VRF exec, netem, ports below 1024 | Warning shown, features may fail |
+
+### iperf3 Feature Detection
+
+The script auto-detects the installed `iperf3` version and enables
+features accordingly:
+
+| Feature | Flag | Detected How |
+|---|---|---|
+| Live output flushing | `--forceflush` | `iperf3 --help` output scan |
+| Unlimited duration | `-t 0` | Version comparison |
+| FQ pacing control | `--no-fq-socket-pacing` | Version comparison |
+
+### Supported Linux Distributions
+
+| Distribution | Status |
+|---|---|
+| Ubuntu 18.04 to 24.04 | Fully supported |
+| Debian 10, 11, 12 | Fully supported |
+| RHEL / CentOS 7, 8, 9 | Fully supported |
+| Rocky Linux / AlmaLinux | Fully supported |
+| Fedora 36 and later | Fully supported |
+| openSUSE Leap 15 | Supported |
+| Alpine Linux | Partial — requires bash and full awk |
+| macOS | Partial — no VRF or netem, bash must be upgraded |
+| Windows WSL2 | Partial — netem unavailable |
+
+---
+
+## Installation
+
+### Step 1 — Install Required Packages
+
+**Ubuntu / Debian**
+```bash
+sudo apt update
+sudo apt install -y iperf3 iproute2 gawk grep coreutils ethtool
+```
+**RHEL / CentOS 7**
+```
+sudo yum install -y iperf3 iproute gawk grep coreutils ethtool
+```
+**RHEL 8+ / Rocky / AlmaLinux / Fedora**
+```
+sudo dnf install -y iperf3 iproute gawk grep coreutils ethtool
+```
+**Build iperf3 from source (for latest version)**
+```
+git clone https://github.com/esnet/iperf.git
+cd iperf
+./configure
+make
+sudo make install
+iperf3 --version
+```
+## Step 2 — Get the Script
+```
+git clone https://github.com/your-org/iperf3-manager.git
+cd iperf3-manager
+```
+
