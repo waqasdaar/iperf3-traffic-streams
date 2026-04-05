@@ -980,6 +980,7 @@ Reverse mode -R? [no]: y
   All 2 stream(s) completed successfully.
 ```
 
-**<span style="color:blue">Stream 1 (forward) shows full 950 Mbps.</span>**
-**<span style="color:red">Stream 2 (reverse) shows only 480 Mbps — confirming upstream asymmetry.</span>**
+**<font color="blue">Stream 1 (forward) shows full 950 Mbps.</font>**
+
+**<font color="blue">Stream 2 (reverse) shows only 480 Mbps.</font> — <font color="red">confirming upstream asymmetry.</font>**
 
