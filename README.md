@@ -68,7 +68,7 @@ quickly in production scenarios:
 
 ### What This Tool Provides
 
-`iperf3_manager.sh` replaces all of that complexity with a single guided
+`iperf3-traffic-flows.sh` replaces all of that complexity with a single guided
 workflow that any operator can use without memorising `iperf3` flags.
 
 ### Who Should Use This Tool
@@ -87,7 +87,7 @@ The script builds a complete orchestration layer around `iperf3`:
 
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
-│ iperf3-traffic-manager.sh                                           │
+│ iperf3-traffic-flows.sh                                             │
 │                                                                     │
 │ 1. Detect system capabilities and iperf3 version                    │
 │ 2. Discover interfaces, IPs, speeds, and VRF memberships            │
