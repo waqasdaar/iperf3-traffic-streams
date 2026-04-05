@@ -865,6 +865,7 @@ BBR achieved higher throughput with fewer retransmissions, suggesting better beh
 
 ## Use Case 8 — Network Impairment Injection
 **Goal**: Simulate degraded or distant network paths by injecting artificial delay, jitter, and packet loss using tc netem.
+
 Typical scenarios:
 - WAN simulation in a lab
 - Satellite link emulation
