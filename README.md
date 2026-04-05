@@ -1209,7 +1209,8 @@ View raw log for stream # (or press Enter/q to quit): 1
 
 **Symptoms**: Status does not advance after several seconds.
 
-Possible causes:
+
+**Possible causes**:
 - Target host is unreachable
 - Server is not running on the target port
 - Firewall is blocking the port
@@ -1227,7 +1228,8 @@ tail -20 /tmp/iperf3_mgr.*/stream_1.log
 
 **Symptoms**: Bandwidth column remains at --- after connection.
 
-Possible causes:
+
+**Possible causes**:
 - First 1-second interval has not yet been written
 - Client is still in the connection handshake
 - Log file is empty or not being written
@@ -1241,7 +1243,10 @@ cat /tmp/iperf3_mgr.*/stream_1.sh
 ### 3. **VRF Test Fails**
 
 **Symptoms**: ip vrf exec fails or produces a permission error.
+
+
 **Cause**: ip vrf exec requires root privileges.
+
 **Fix:**
 ```
 sudo ./iperf3-traffic-streams.sh
@@ -1250,6 +1255,8 @@ sudo ./iperf3-traffic-streams.sh
 ### 4. **tc netem Not Applied**
 
 **Symptoms**: [NETEM] line does not appear after configuration.
+
+
 **Possible causes**:
 
 - Script not running as root
