@@ -1204,3 +1204,126 @@ View raw log for stream # (or press Enter/q to quit): 1
   Cleanup complete. All resources released.
 
 ```
+
+## Troubleshooting
+
+**Stream Stuck at STARTING**
+
+**Symptoms**: Status does not advance after several seconds.
+
+Possible causes:
+- Target host is unreachable
+- Server is not running on the target port
+- Firewall is blocking the port
+- VRF mismatch between client and server
+
+**Checks**
+```
+ping <target_ip>
+ip route get <target_ip>
+ss -tlnp | grep 5201
+tail -20 /tmp/iperf3_mgr.*/stream_1.log
+```
+
+**Bandwidth Shows ---**
+
+**Symptoms**: Bandwidth column remains at --- after connection.
+
+Possible causes:
+- First 1-second interval has not yet been written
+- Client is still in the connection handshake
+- Log file is empty or not being written
+
+**Checks**
+```
+tail -f /tmp/iperf3_mgr.*/stream_1.log
+cat /tmp/iperf3_mgr.*/stream_1.sh
+```
+**VRF Test Fails**
+
+**Symptoms**: ip vrf exec fails or produces a permission error.
+**Cause**: ip vrf exec requires root privileges.
+**Fix:**
+```
+sudo ./iperf3_manager.sh
+```
+**tc netem Not Applied**
+
+**Symptoms**: [NETEM] line does not appear after configuration.
+**Possible causes**:
+
+- Script not running as root
+- tc binary not installed
+- No route found for target IP
+  
+**Checks**:
+```
+which tc
+sudo tc qdisc show
+ip route get <target_ip>
+sudo ./iperf3_manager.sh
+```
+
+**Dashboard Scrolls or Reprints**
+
+**Symptoms**: Dashboard prints new headers instead of updating in place.
+
+
+**Possible causes**:
+- Terminal window width is less than 80 columns
+- Terminal emulator does not honour ANSI escape sequences
+
+**Fix**:
+```
+# Resize terminal to at least 80 columns
+# Or explicitly set columns
+export COLUMNS=80
+./iperf3_manager.sh
+```
+
+**iperf3 Not Found**
+
+**Symptoms**: Script exits with ERROR: iperf3 not found.
+
+
+**Fix**:
+```
+# Ubuntu / Debian
+sudo apt install -y iperf3
+
+# RHEL / Rocky / AlmaLinux
+sudo dnf install -y iperf3
+
+which iperf3
+iperf3 --version
+```
+
+**Bash Version Too Old**
+
+**Symptoms**: declare: -A: invalid option or unexpected syntax errors.
+
+
+**Cause**: Bash version is below 4.0. Common on macOS which ships 3.2.
+
+
+**Fix**:
+```
+bash --version
+
+# macOS upgrade via Homebrew
+brew install bash
+echo /usr/local/bin/bash | sudo tee -a /etc/shells
+chsh -s /usr/local/bin/bash
+```
+
+## Known Limitations
+| Area             | Detail                                                     |
+|------------------|------------------------------------------------------------|
+| IPv6             | /proc/net/tcp parsing targets IPv4; IPv6 uses ss fallback  |
+| macOS            | No VRF support; no tc netem; bash must be upgraded to 4.0+ |
+| Windows WSL2     | tc netem not available                                     |
+| Bash below 4.0   | Associative arrays not supported; script will not run      |
+| Stream count     | Very high stream counts may exhaust file descriptors       |
+| JSON output      | Deliberately not used; JSON is buffered until process exit |
+| Log preservation | Logs are deleted on cleanup; copy them before exiting      |
+| --forceflush     | Only available in newer iperf3 versions; auto-detected     |
