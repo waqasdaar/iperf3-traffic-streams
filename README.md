@@ -295,10 +295,55 @@ Protocol [TCP/UDP]: TCP
 Target IP: 192.168.1.10
 Port [5201]: 5201
 Bandwidth: Enter             # unlimited
-Duration [10]: 30
+Duration [10]: 60
 DSCP: Enter                  # none
 Parallel threads [1]: 1
 Launch 1 stream(s)? [Y/n]: Y
 ```
 
+## Application Menu
+
+```
++==============================================================================+
+|             iperf3 Multi-Stream Traffic Manager  v7.7                        |
++==============================================================================+
+|                                                                              |
+|   1   Interface Table        View interfaces, IPs, speeds, VRF mapping       |
+|   2   Server Mode            Start one or more iperf3 server listeners       |
+|   3   Client Mode            Launch one or more client traffic streams       |
+|   4   Loopback Test          Local server + client for quick validation      |
+|   5   DSCP Reference Table   Show DSCP names, values, TOS, and use cases     |
+|   6   Exit                                                                   |
+|                                                                              |
++==============================================================================+
+```
+
+**Interface Table Example**
+
+```
++----+---------------+--------------------+----------+----------+--------------+
+|  # | Interface     | IP Address         | State    | Speed    | VRF          |
++----+---------------+--------------------+----------+----------+--------------+
+| [ GRT -- Global Routing Table ]  (1 interface(s))                            |
++----+---------------+--------------------+----------+----------+--------------+
+|  1 | eth0          | 192.168.1.100      | up       | 1000Mb/s | GRT          |
++----+---------------+--------------------+----------+----------+--------------+
+| [ VRF: vrf10 ]  (2 interface(s))                                             |
++----+---------------+--------------------+----------+----------+--------------+
+|  2 | eth1          | 10.10.114.3        | up       | 1000Mb/s | vrf10        |
+|  3 | eth2          | 10.10.115.3        | up       | 1000Mb/s | vrf10        |
++----+---------------+--------------------+----------+----------+--------------+
+| [ VRF: vrf20 ]  (1 interface(s))                                             |
++----+---------------+--------------------+----------+----------+--------------+
+|  4 | eth3          | 172.16.20.1        | up       | 10Gb/s   | vrf20        |
++----+---------------+--------------------+----------+----------+--------------+
+```
+## Use Cases
+
+### Use Case 1 — Basic TCP Throughput Test
+**Goal**: Measure end-to-end __TCP__ throughput between two hosts.
+Typical scenarios:
+- Baseline measurement before and after a change
+- Cabling or switch troubleshooting
+- Validating link capacity
 
