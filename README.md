@@ -263,3 +263,42 @@ sudo ./iperf3-traffic-streams.sh
 
   Select [1-6]:
 ```
+## Quick Start
+60-Second Bandwidth Test Between Two Hosts
+
+```
+sudo ./iperf3-traffic-streams.sh
+```
+
+```
+Select [1-6]: 2              # Server Mode
+Selection [0]: 0             # Bind all interfaces
+How many listeners? [1]: 1
+Listen port [5201]: 5201
+Bind IP: Enter               # 0.0.0.0
+VRF: Enter                   # none
+One-off mode? [no]: n
+Launch 1 listener(s)? [Y/n]: Y
+```
+
+**On the client host**
+
+```
+sudo ./iperf3-traffic-streams.sh
+```
+
+```
+Select [1-6]: 3              # Client Mode
+Selection [0]: 0             # auto source
+How many streams? [1]: 1
+Protocol [TCP/UDP]: TCP
+Target IP: 192.168.1.10
+Port [5201]: 5201
+Bandwidth: Enter             # unlimited
+Duration [10]: 30
+DSCP: Enter                  # none
+Parallel threads [1]: 1
+Launch 1 stream(s)? [Y/n]: Y
+```
+
+
