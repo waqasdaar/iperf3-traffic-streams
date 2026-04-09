@@ -1,8 +1,7 @@
 #!/usr/bin/env bash
 # =============================================================================
-# iperf3_manager.sh — Enterprise-grade iperf3 multi-stream traffic manager
+# iperf3-traffic-streams.sh — Enterprise-grade iperf3 multi-stream traffic manager
 # Version: 8.1
-# Author Name : Waqas Daar (waqasdaar@gmail.com)
 # =============================================================================
 
 # =============================================================================
@@ -91,25 +90,25 @@ _assoc_clear() {
     eval "_ASSOC_VALS_${name}=()"
 }
 
-_iface_to_vrf_set()   {
+_iface_to_vrf_set() {
     (( BASH_MAJOR >= 4 )) && IFACE_TO_VRF["$1"]="$2"  || _assoc_set  "IFACE_TO_VRF" "$1" "$2"
 }
-_iface_to_vrf_get()   {
+_iface_to_vrf_get() {
     (( BASH_MAJOR >= 4 )) && printf '%s' "${IFACE_TO_VRF[$1]:-}" || _assoc_get "IFACE_TO_VRF" "$1"
 }
-_iface_to_vrf_has()   {
+_iface_to_vrf_has() {
     (( BASH_MAJOR >= 4 )) && [[ -n "${IFACE_TO_VRF[$1]+x}" ]] || _assoc_has "IFACE_TO_VRF" "$1"
 }
 _iface_to_vrf_clear() {
     (( BASH_MAJOR >= 4 )) && IFACE_TO_VRF=() || _assoc_clear "IFACE_TO_VRF"
 }
-_vrf_masters_set()    {
+_vrf_masters_set() {
     (( BASH_MAJOR >= 4 )) && VRF_MASTERS["$1"]="$2"   || _assoc_set  "VRF_MASTERS"  "$1" "$2"
 }
-_vrf_masters_has()    {
+_vrf_masters_has() {
     (( BASH_MAJOR >= 4 )) && [[ -n "${VRF_MASTERS[$1]+x}" ]] || _assoc_has "VRF_MASTERS"  "$1"
 }
-_vrf_masters_clear()  {
+_vrf_masters_clear() {
     (( BASH_MAJOR >= 4 )) && VRF_MASTERS=() || _assoc_clear "VRF_MASTERS"
 }
 
@@ -146,6 +145,7 @@ CLEANUP_DONE=0
 declare -a STREAM_PIDS=()
 declare -a SERVER_PIDS=()
 declare -a NETEM_IFACES=()
+
 declare -a S_PROTO=()
 declare -a S_TARGET=()
 declare -a S_PORT=()
@@ -169,8 +169,6 @@ declare -a S_SCRIPT=()
 declare -a S_START_TS=()
 declare -a S_STATUS_CACHE=()
 declare -a S_ERROR_MSG=()
-
-# Per-stream final bandwidth cache — populated when a stream transitions to DONE
 declare -a S_FINAL_SENDER_BW=()
 declare -a S_FINAL_RECEIVER_BW=()
 
@@ -180,8 +178,9 @@ declare -a SRV_VRF=()
 declare -a SRV_ONEOFF=()
 declare -a SRV_LOGFILE=()
 declare -a SRV_SCRIPT=()
+declare -a SRV_PREV_STATE=()
+declare -a SRV_BW_CACHE=()
 
-# Result arrays at global scope
 declare -a RESULT_SENDER_BW=()
 declare -a RESULT_RECEIVER_BW=()
 declare -a RESULT_RTX=()
@@ -196,9 +195,6 @@ declare -a IFACE_STATES=()
 declare -a IFACE_SPEEDS=()
 declare -a IFACE_VRFS=()
 
-declare -a SRV_PREV_STATE=()
-declare -a SRV_BW_CACHE=()
-
 STREAM_COUNT=0
 SERVER_COUNT=0
 FRAME_LINES=0
@@ -207,44 +203,7 @@ PROMPT_DSCP_VAL=-1
 SELECTED_IFACE=""
 SELECTED_IP=""
 SELECTED_VRF=""
-
-# Global: tracks total lines rendered in the previous dashboard tick
-# Used by run_dashboard to know how far up to move the cursor
-_LAST_RENDER_LINES=0
-# Global: dynamic panel lines rendered in the previous tick
 _PREV_DYNAMIC_LINES=0
-
-# ---------------------------------------------------------------------------
-# _count_completed_panel_lines
-# Returns the number of lines that _render_completed_panel will print.
-# ---------------------------------------------------------------------------
-
-_count_completed_panel_lines() {
-    local done_count=0 i
-    for (( i=0; i<STREAM_COUNT; i++ )); do
-        [[ "${S_STATUS_CACHE[$i]}" == "DONE" ]] && (( done_count++ ))
-    done
-    (( done_count == 0 )) && { printf '%d' 0; return; }
-    # Panel anatomy:
-    #   line 1   top border        bline '='
-    #   line 2   title             bcenter
-    #   line 3   title border      bline '='
-    #   line 4   column header     bleft
-    #   line 5   separator         bline '-'
-    #   lines 6..(5+N)  data rows
-    #   line 6+N  bottom border    bline '='
-    # Total: 6 + done_count
-    printf '%d' $(( 6 + done_count ))
-}
-
-_count_failed_panel_lines() {
-    local fail_count=0 i
-    for (( i=0; i<STREAM_COUNT; i++ )); do
-        [[ "${S_STATUS_CACHE[$i]}" == "FAILED" ]] && (( fail_count++ ))
-    done
-    (( fail_count == 0 )) && { printf '%d' 0; return; }
-    printf '%d' $(( 6 + fail_count ))
-}
 
 # =============================================================================
 # SECTION 1 — PRIMITIVES
@@ -344,7 +303,7 @@ bempty() {
 }
 
 print_header() {
-    local t="${1:-iperf3 Manager}"
+    local t="${1:-iperf3 Traffic Streams}"
     bline '='; bempty; bcenter "${BOLD}${CYAN}${t}${NC}"; bempty; bline '='
 }
 
@@ -378,28 +337,15 @@ _format_bps() {
     }')"
 }
 
-# ---------------------------------------------------------------------------
-# _normalise_text_bw  <"value unit">
-#
-# Converts a raw iperf3 bandwidth string such as "9.91 Mbits/sec" into a
-# compact human-readable form such as "9.91 Mbps".
-# Returns "---" only when the input is empty or non-numeric.
-# Does NOT suppress zero values — a legitimate 0 bps measurement is shown.
-# ---------------------------------------------------------------------------
-
 _normalise_text_bw() {
     local raw="$1"
     [[ -z "$raw" ]] && { printf '%s' '---'; return; }
-
     local val unit
-    # Use awk to split on whitespace robustly — handles multiple spaces
     val=$(printf '%s' "$raw"  | awk '{print $1}')
     unit=$(printf '%s' "$raw" | awk '{print $2}')
-
     if [[ ! "$val" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
         printf '%s' '---'; return
     fi
-
     printf '%s' "$(awk -v v="$val" -v u="$unit" 'BEGIN {
         b = v
         if      (u ~ /[Gg]bits/) b = v * 1e9
@@ -412,60 +358,30 @@ _normalise_text_bw() {
     }')"
 }
 
-# ---------------------------------------------------------------------------
-# parse_live_bandwidth_from_log  <logfile>
-#
-# Extracts the most recent per-second interval bandwidth from an iperf3
-# plain-text log file.
-#
-# Strategy:
-#   1. Match interval lines: [  N]  X.XX-Y.YY  sec  ...
-#      or [SUM]  X.XX-Y.YY  sec  ...
-#   2. Exclude final sender/receiver summary lines.
-#   3. From the matched line, extract the token immediately before
-#      "bits/sec" (or "Mbits/sec" etc.) using awk field scanning.
-#      This is field-position independent and handles TCP and UDP output
-#      formats identically.
-#
-# Returns "---" when no valid sample exists yet.
-# ---------------------------------------------------------------------------
 parse_live_bandwidth_from_log() {
     local logfile="$1"
     [[ ! -f "$logfile" || ! -s "$logfile" ]] && { printf '%s' '---'; return; }
-
     local ll=""
-
-    # Prefer [SUM] lines for parallel -P streams
     ll=$(grep -E '^\[SUM\][[:space:]]+[0-9.]+-[0-9.]+[[:space:]]+sec' \
          "$logfile" 2>/dev/null \
          | grep -vE '[[:space:]](sender|receiver)[[:space:]]*$' \
          | tail -1)
-
-    # Fall back to single-stream interval lines
     if [[ -z "$ll" ]]; then
         ll=$(grep -E '^\[[[:space:]]*[0-9]+\][[:space:]]+[0-9.]+-[0-9.]+[[:space:]]+sec' \
              "$logfile" 2>/dev/null \
              | grep -vE '[[:space:]](sender|receiver)[[:space:]]*$' \
              | tail -1)
     fi
-
     [[ -z "$ll" ]] && { printf '%s' '---'; return; }
-
-    # Extract value + unit by scanning fields for a bits/sec token
-    # Works for:  "9.91 Mbits/sec"  "1.05 Gbits/sec"  "512 Kbits/sec"  "9 bits/sec"
     local result
     result=$(printf '%s\n' "$ll" | awk '
     {
         for (i = 1; i <= NF; i++) {
             if ($i ~ /^[KMGkmg]?bits\/sec$/) {
-                if (i > 1) {
-                    print $(i-1) " " $i
-                    exit
-                }
+                if (i > 1) { print $(i-1) " " $i; exit }
             }
         }
     }')
-
     if [[ -n "$result" ]]; then
         _normalise_text_bw "$result"
     else
@@ -502,32 +418,19 @@ parse_retransmits_from_log() {
     printf '%s' "0"
 }
 
-# ---------------------------------------------------------------------------
-# _capture_final_bw  <stream_index>
-#
-# Called once when a stream transitions to DONE.
-# Reads sender/receiver BW from the log and stores in S_FINAL_SENDER_BW
-# and S_FINAL_RECEIVER_BW arrays so the completed panel can display them.
-# ---------------------------------------------------------------------------
 _capture_final_bw() {
     local idx="$1"
     local lf="${S_LOGFILE[$idx]:-}"
-
-    # If already captured skip
     [[ -n "${S_FINAL_SENDER_BW[$idx]:-}" ]] && return
-
     local sbw rbw
     sbw=$(parse_final_bw_from_log "$lf" "sender")
     rbw=$(parse_final_bw_from_log "$lf" "receiver")
-
-    # Fall back to last live sample if final summary not yet written
     if [[ -z "$sbw" || "$sbw" == "---" ]]; then
         sbw=$(parse_live_bandwidth_from_log "$lf")
     fi
     if [[ -z "$rbw" || "$rbw" == "---" ]]; then
         rbw="$sbw"
     fi
-
     S_FINAL_SENDER_BW[$idx]="${sbw:-N/A}"
     S_FINAL_RECEIVER_BW[$idx]="${rbw:-N/A}"
 }
@@ -545,7 +448,7 @@ cleanup() {
     printf '\033[?25h' >/dev/tty 2>/dev/null; printf '\n' >/dev/tty 2>/dev/null
     local sep; sep=$(rpt '=' $(( COLS - 2 )))
     tty_echo "${BOLD}${CYAN}+${sep}+${NC}"
-    tty_echo "${BOLD}${CYAN}  iperf3 Manager -- Cleanup  [signal: ${sn}]${NC}"
+    tty_echo "${BOLD}${CYAN}  iperf3 Traffic Streams -- Cleanup  [signal: ${sn}]${NC}"
     tty_echo "${BOLD}${CYAN}+${sep}+${NC}"
     local killed=0 already=0
 
@@ -566,7 +469,8 @@ cleanup() {
                     kill -KILL "$pid" 2>/dev/null; wait "$pid" 2>/dev/null
                     tty_echo "    ${RED}[KILLED]${NC}  PID $pid  $lbl"
                 else
-                    wait "$pid" 2>/dev/null; tty_echo "    ${GREEN}[STOP  ]${NC}  PID $pid  $lbl"
+                    wait "$pid" 2>/dev/null
+                    tty_echo "    ${GREEN}[STOP  ]${NC}  PID $pid  $lbl"
                 fi; (( killed++ ))
             else
                 wait "$pid" 2>/dev/null
@@ -592,7 +496,8 @@ cleanup() {
                     kill -KILL "$pid" 2>/dev/null; wait "$pid" 2>/dev/null
                     tty_echo "    ${RED}[KILLED]${NC}  PID $pid  $lbl"
                 else
-                    wait "$pid" 2>/dev/null; tty_echo "    ${GREEN}[STOP  ]${NC}  PID $pid  $lbl"
+                    wait "$pid" 2>/dev/null
+                    tty_echo "    ${GREEN}[STOP  ]${NC}  PID $pid  $lbl"
                 fi; (( killed++ ))
             else
                 wait "$pid" 2>/dev/null
@@ -716,7 +621,7 @@ check_root() {
 }
 
 init_tmpdir() {
-    TMPDIR=$(mktemp -d /tmp/iperf3_mgr.XXXXXX)
+    TMPDIR=$(mktemp -d /tmp/iperf3_streams.XXXXXX)
     [[ -d "$TMPDIR" ]] || { printf '%b\n' "${RED}ERROR: cannot create temp dir.${NC}"; exit 1; }
 }
 
@@ -760,8 +665,6 @@ build_vrf_maps() {
     done
 }
 
-# ── Interface state ───────────────────────────────────────────────────────────
-
 _get_iface_state_linux() {
     local iface="$1" fl=""
     command -v ip >/dev/null 2>&1 && fl=$(ip link show dev "$iface" 2>/dev/null | head -1)
@@ -792,10 +695,8 @@ _get_iface_state_macos() {
     local out
     out=$(ifconfig "$iface" 2>/dev/null)
     [[ -z "$out" ]] && { printf '%s' 'unknown'; return; }
-
     if echo "$out" | grep -q 'status: active';   then printf '%s' 'up';         return; fi
     if echo "$out" | grep -q 'status: inactive'; then printf '%s' 'no-carrier'; return; fi
-
     local flags_field
     flags_field=$(echo "$out" | head -1 | grep -oE '<[^>]+>')
     if [[ -n "$flags_field" ]]; then
@@ -817,8 +718,6 @@ get_iface_state() {
     if [[ "$OS_TYPE" == "macos" ]]; then _get_iface_state_macos "$1"
     else                                  _get_iface_state_linux "$1"; fi
 }
-
-# ── Interface speed ───────────────────────────────────────────────────────────
 
 _get_iface_speed_linux() {
     local iface="$1"
@@ -862,8 +761,6 @@ get_iface_speed() {
     if [[ "$OS_TYPE" == "macos" ]]; then _get_iface_speed_macos "$1"
     else                                  _get_iface_speed_linux "$1"; fi
 }
-
-# ── Interface list ────────────────────────────────────────────────────────────
 
 _get_interface_list_linux() {
     IFACE_NAMES=(); IFACE_IPS=(); IFACE_STATES=(); IFACE_SPEEDS=(); IFACE_VRFS=()
@@ -927,17 +824,10 @@ get_interface_list() {
 }
 
 # =============================================================================
-# SECTION 7 — INTERFACE TABLE  (dynamic column widths)
+# SECTION 7 — INTERFACE TABLE (dynamic column widths)
 # =============================================================================
 
-# ---------------------------------------------------------------------------
-# _build_iface_col_widths
-#
-# Computes _CN _CI _CIP _CS _CSP _CV from actual IFACE_* array data so no
-# value is ever truncated.  Falls back to minimum widths when arrays empty.
-# ---------------------------------------------------------------------------
 _build_iface_col_widths() {
-    # Measure header label widths using local variables (${#"..."} is invalid)
     local _h_num=" #"
     local _h_iface=" Interface"
     local _h_ip=" IP Address"
@@ -945,7 +835,6 @@ _build_iface_col_widths() {
     local _h_speed=" Speed"
     local _h_vrf=" VRF"
 
-    # Start from header label width + 1 trailing space
     _CN=$(( ${#_h_num}    + 1 ))
     _CI=$(( ${#_h_iface}  + 1 ))
     _CIP=$(( ${#_h_ip}    + 1 ))
@@ -953,7 +842,6 @@ _build_iface_col_widths() {
     _CSP=$(( ${#_h_speed} + 1 ))
     _CV=$(( ${#_h_vrf}    + 1 ))
 
-    # Enforce absolute minimums
     (( _CN  < 4  )) && _CN=4
     (( _CI  < 10 )) && _CI=10
     (( _CIP < 10 )) && _CIP=10
@@ -990,7 +878,6 @@ _build_iface_col_widths() {
         (( vrf_w > _CV )) && _CV=$vrf_w
     done
 
-    # Cap total row width at COLS — shrink IP column first then name column
     local total=$(( _CN + _CI + _CIP + _CS + _CSP + _CV + 7 ))
     if (( total > COLS )); then
         local excess=$(( total - COLS ))
@@ -1012,22 +899,15 @@ _build_iface_col_widths() {
 
 _iface_rule() {
     printf '+%s+%s+%s+%s+%s+%s+\033[K\n' \
-        "$(rpt '-' $_CN)"  \
-        "$(rpt '-' $_CI)"  \
-        "$(rpt '-' $_CIP)" \
-        "$(rpt '-' $_CS)"  \
-        "$(rpt '-' $_CSP)" \
-        "$(rpt '-' $_CV)"
+        "$(rpt '-' $_CN)"  "$(rpt '-' $_CI)"  "$(rpt '-' $_CIP)" \
+        "$(rpt '-' $_CS)"  "$(rpt '-' $_CSP)" "$(rpt '-' $_CV)"
 }
 
 _iface_hdr() {
     printf '|%s|%s|%s|%s|%s|%s|\033[K\n' \
-        "$(pad_to " #"          $_CN)"  \
-        "$(pad_to " Interface"  $_CI)"  \
-        "$(pad_to " IP Address" $_CIP)" \
-        "$(pad_to " State"      $_CS)"  \
-        "$(pad_to " Speed"      $_CSP)" \
-        "$(pad_to " VRF"        $_CV)"
+        "$(pad_to " #"          $_CN)"  "$(pad_to " Interface"  $_CI)" \
+        "$(pad_to " IP Address" $_CIP)" "$(pad_to " State"      $_CS)" \
+        "$(pad_to " Speed"      $_CSP)" "$(pad_to " VRF"        $_CV)"
 }
 
 _iface_banner() {
@@ -1053,69 +933,42 @@ _iface_row() {
     esac
     local fs; fs=$(pad_to " $state" $_CS)
     printf '|%s|%s|%s|%b%s%b|%s|%s|\033[K\n' \
-        "$(pad_to " $num"   $_CN)"  \
-        "$(pad_to " $iface" $_CI)"  \
-        "$(pad_to " $ip"    $_CIP)" \
-        "$sc" "$fs" "$NC"           \
-        "$(pad_to " $speed" $_CSP)" \
-        "$(pad_to " $vrf"   $_CV)"
+        "$(pad_to " $num"   $_CN)"  "$(pad_to " $iface" $_CI)" \
+        "$(pad_to " $ip"    $_CIP)" "$sc" "$fs" "$NC" \
+        "$(pad_to " $speed" $_CSP)" "$(pad_to " $vrf"   $_CV)"
 }
 
 show_interface_table() {
     local total=${#IFACE_NAMES[@]}
-
-    bline '='
-    bcenter "${BOLD}Network Interfaces${NC}"
-    bline '='
-
+    bline '='; bcenter "${BOLD}Network Interfaces${NC}"; bline '='
     if (( total == 0 )); then
-        bempty
-        bleft "  No interfaces found."
-        bempty
-        bline '='
-        return
+        bempty; bleft "  No interfaces found."; bempty; bline '='; return
     fi
-
     _build_iface_col_widths
-
-    _iface_rule
-    _iface_hdr
-    _iface_rule
+    _iface_rule; _iface_hdr; _iface_rule
 
     if [[ "$OS_TYPE" == "macos" ]]; then
         _iface_banner "[ All Interfaces (macOS) ]  (${total} interface(s))"
         _iface_rule
         local i
         for (( i=0; i<total; i++ )); do
-            _iface_row \
-                "$((i+1))"          \
-                "${IFACE_NAMES[$i]}" \
-                "${IFACE_IPS[$i]}"   \
-                "${IFACE_STATES[$i]}"\
-                "${IFACE_SPEEDS[$i]}"\
-                "${IFACE_VRFS[$i]}"
+            _iface_row "$((i+1))" "${IFACE_NAMES[$i]}" "${IFACE_IPS[$i]}" \
+                "${IFACE_STATES[$i]}" "${IFACE_SPEEDS[$i]}" "${IFACE_VRFS[$i]}"
         done
     else
         local i gc=0
         for (( i=0; i<total; i++ )); do
             [[ "${IFACE_VRFS[$i]}" == "GRT" ]] && (( gc++ ))
         done
-
         if (( gc > 0 )); then
             _iface_banner "[ GRT -- Global Routing Table ]  (${gc} interface(s))"
             _iface_rule
             for (( i=0; i<total; i++ )); do
                 [[ "${IFACE_VRFS[$i]}" != "GRT" ]] && continue
-                _iface_row \
-                    "$((i+1))"           \
-                    "${IFACE_NAMES[$i]}"  \
-                    "${IFACE_IPS[$i]}"    \
-                    "${IFACE_STATES[$i]}" \
-                    "${IFACE_SPEEDS[$i]}" \
-                    "GRT"
+                _iface_row "$((i+1))" "${IFACE_NAMES[$i]}" "${IFACE_IPS[$i]}" \
+                    "${IFACE_STATES[$i]}" "${IFACE_SPEEDS[$i]}" "GRT"
             done
         fi
-
         local vn
         for vn in "${VRF_LIST[@]}"; do
             local mc=0
@@ -1128,86 +981,43 @@ show_interface_table() {
             _iface_rule
             for (( i=0; i<total; i++ )); do
                 [[ "${IFACE_VRFS[$i]}" != "$vn" ]] && continue
-                _iface_row \
-                    "$((i+1))"           \
-                    "${IFACE_NAMES[$i]}"  \
-                    "${IFACE_IPS[$i]}"    \
-                    "${IFACE_STATES[$i]}" \
-                    "${IFACE_SPEEDS[$i]}" \
-                    "$vn"
+                _iface_row "$((i+1))" "${IFACE_NAMES[$i]}" "${IFACE_IPS[$i]}" \
+                    "${IFACE_STATES[$i]}" "${IFACE_SPEEDS[$i]}" "$vn"
             done
         done
     fi
-
-    _iface_rule
-    bline '='
+    _iface_rule; bline '='
 }
 
-# ---------------------------------------------------------------------------
-# select_bind_interface  <mode>
-#
-# Displays the interface table and prompts the operator to select an
-# interface by number.  Populates SELECTED_IFACE, SELECTED_IP, SELECTED_VRF.
-#
-# mode: "server"  →  prompt text says "bind" (listen on this address)
-#       "client"  →  prompt text says "source bind" (send from this address)
-#
-# Entering 0 skips selection:
-#   server mode → binds to 0.0.0.0 (all interfaces)
-#   client mode → iperf3 picks the source address automatically
-# ---------------------------------------------------------------------------
 select_bind_interface() {
     local mode="${1:-client}"
     local total=${#IFACE_NAMES[@]}
-    SELECTED_IFACE=""
-    SELECTED_IP=""
-    SELECTED_VRF=""
-
-    show_interface_table
-    echo ""
-
+    SELECTED_IFACE=""; SELECTED_IP=""; SELECTED_VRF=""
+    show_interface_table; echo ""
     if [[ "$mode" == "server" ]]; then
         echo "  Enter interface # to bind, or 0 for all (0.0.0.0):"
     else
         echo "  Enter interface # as source bind, or 0 to skip (auto):"
     fi
     echo ""
-
     local sel
     while true; do
-        read -r -p "  Selection [0]: " sel </dev/tty
-        sel="${sel:-0}"
-
+        read -r -p "  Selection [0]: " sel </dev/tty; sel="${sel:-0}"
         if [[ ! "$sel" =~ ^[0-9]+$ ]]; then
-            printf '%b\n' "${RED}  Please enter a number (0-${total}).${NC}"
-            continue
+            printf '%b\n' "${RED}  Please enter a number (0-${total}).${NC}"; continue
         fi
-
         if (( sel == 0 )); then
-            SELECTED_IFACE=""
-            SELECTED_IP=""
-            SELECTED_VRF=""
-            return 0
-
+            SELECTED_IFACE=""; SELECTED_IP=""; SELECTED_VRF=""; return 0
         elif (( sel >= 1 && sel <= total )); then
             local idx=$(( sel - 1 ))
-            SELECTED_IFACE="${IFACE_NAMES[$idx]}"
-            SELECTED_IP="${IFACE_IPS[$idx]}"
+            SELECTED_IFACE="${IFACE_NAMES[$idx]}"; SELECTED_IP="${IFACE_IPS[$idx]}"
             SELECTED_VRF="${IFACE_VRFS[$idx]}"
-
-            if [[ "${IFACE_STATES[$idx]}" != "up" ]]; then
-                printf '%b\n' \
-                    "${YELLOW}  WARNING: ${SELECTED_IFACE} state='${IFACE_STATES[$idx]}'. Proceeding anyway.${NC}"
-            fi
-
-            # GRT is the internal label — pass empty string to callers
-            # so no VRF prefix is added to commands
+            [[ "${IFACE_STATES[$idx]}" != "up" ]] && \
+                printf '%b\n' "${YELLOW}  WARNING: ${SELECTED_IFACE} state='${IFACE_STATES[$idx]}'. Proceeding.${NC}"
             [[ "$SELECTED_VRF" == "GRT" ]] && SELECTED_VRF=""
-
             return 0
-
         else
-            printf '%b\n' "${RED}  Invalid selection. Enter 0 or 1-${total}.${NC}"
+            printf '%b\n' "${RED}  Invalid. Enter 0 or 1-${total}.${NC}"
         fi
     done
 }
@@ -1295,13 +1105,8 @@ configure_client_streams() {
 
     for (( i=0; i<num; i++ )); do
         local sn=$(( i + 1 ))
-        echo ""
-        bline '='
-        bcenter "${BOLD}Client Stream ${sn} of ${num}${NC}"
-        bline '='
-        echo ""
+        echo ""; bline '='; bcenter "${BOLD}Client Stream ${sn} of ${num}${NC}"; bline '='; echo ""
 
-        # ── Protocol ─────────────────────────────────────────────────────────
         local proto
         while true; do
             read -r -p "  Protocol [TCP/UDP] (default TCP): " proto </dev/tty
@@ -1312,7 +1117,6 @@ configure_client_streams() {
         done
         S_PROTO+=("$proto")
 
-        # ── Target ───────────────────────────────────────────────────────────
         local tprompt
         [[ -n "$lt" ]] \
             && tprompt="  Target server IP/hostname [$lt]" \
@@ -1322,18 +1126,14 @@ configure_client_streams() {
             read -r -p "${tprompt}: " tgt </dev/tty
             tgt="${tgt:-$lt}"
             if [[ -z "$tgt" ]]; then
-                printf '%b\n' "${RED}  Target is required.${NC}"
-                continue
+                printf '%b\n' "${RED}  Target is required.${NC}"; continue
             fi
             validate_ip "$tgt" || \
-                printf '%b\n' \
-                    "${YELLOW}  Warning: '${tgt}' may not be a valid IP/hostname. Continuing.${NC}"
+                printf '%b\n' "${YELLOW}  Warning: '${tgt}' may not be valid. Continuing.${NC}"
             break
         done
-        lt="$tgt"
-        S_TARGET+=("$tgt")
+        lt="$tgt"; S_TARGET+=("$tgt")
 
-        # ── Port ─────────────────────────────────────────────────────────────
         local dp=$(( lp + 1 )) port
         while true; do
             read -r -p "  Server port [$dp]: " port </dev/tty
@@ -1341,16 +1141,13 @@ configure_client_streams() {
             if validate_port "$port"; then
                 port=$(( 10#$port ))
                 (( port < 1024 && IS_ROOT == 0 )) && \
-                    printf '%b\n' \
-                        "${YELLOW}  WARNING: port $port < 1024 requires root.${NC}"
+                    printf '%b\n' "${YELLOW}  WARNING: port $port < 1024 requires root.${NC}"
                 break
             fi
             printf '%b\n' "${RED}  Invalid port. Enter 1-65535.${NC}"
         done
-        lp="$port"
-        S_PORT+=("$port")
+        lp="$port"; S_PORT+=("$port")
 
-        # ── Bandwidth ────────────────────────────────────────────────────────
         local bw=""
         if [[ "$proto" == "UDP" ]]; then
             while true; do
@@ -1369,65 +1166,49 @@ configure_client_streams() {
         fi
         S_BW+=("$bw")
 
-        # ── Duration ─────────────────────────────────────────────────────────
         local din dval
         while true; do
             read -r -p "  Duration seconds (0=unlimited) [10]: " din </dev/tty
             din="${din:-10}"
             if validate_duration "$din"; then
                 [[ "$din" == "unlimited" || "$din" == "inf" ]] \
-                    && dval=0 \
-                    || dval=$(( 10#$din ))
+                    && dval=0 || dval=$(( 10#$din ))
                 break
             fi
-            printf '%b\n' \
-                "${RED}  Invalid. Enter a non-negative integer or 'unlimited'.${NC}"
+            printf '%b\n' "${RED}  Invalid. Enter a non-negative integer or 'unlimited'.${NC}"
         done
         S_DURATION+=("$dval")
 
-        # ── DSCP ─────────────────────────────────────────────────────────────
         prompt_dscp "$sn"
-        S_DSCP_NAME+=("$PROMPT_DSCP_NAME")
-        S_DSCP_VAL+=("$PROMPT_DSCP_VAL")
+        S_DSCP_NAME+=("$PROMPT_DSCP_NAME"); S_DSCP_VAL+=("$PROMPT_DSCP_VAL")
 
-        # ── Parallel threads ──────────────────────────────────────────────────
         local pv
         while true; do
             read -r -p "  Parallel threads (-P) [1]: " pv </dev/tty
             pv="${pv:-1}"
             if [[ "$pv" =~ ^[0-9]+$ ]] && (( 10#$pv >= 1 && 10#$pv <= 128 )); then
-                pv=$(( 10#$pv ))
-                break
+                pv=$(( 10#$pv )); break
             fi
             printf '%b\n' "${RED}  Enter 1-128.${NC}"
         done
         S_PARALLEL+=("$pv")
 
-        # ── Reverse mode ──────────────────────────────────────────────────────
-        local ri
-        read -r -p "  Reverse mode -R? [no]: " ri </dev/tty
-        local rev=0
-        [[ "$ri" =~ ^[Yy] ]] && rev=1
+        local ri; read -r -p "  Reverse mode -R? [no]: " ri </dev/tty
+        local rev=0; [[ "$ri" =~ ^[Yy] ]] && rev=1
         S_REVERSE+=("$rev")
 
-        # ── TCP options ───────────────────────────────────────────────────────
         local cca="" win="" mss=""
         if [[ "$proto" == "TCP" ]]; then
-            echo ""
-            printf '%b\n' "${CYAN}  -- TCP Options (press Enter to skip each) --${NC}"
+            echo ""; printf '%b\n' "${CYAN}  -- TCP Options (press Enter to skip each) --${NC}"
             if [[ "$OS_TYPE" == "linux" ]]; then
-                if [[ -r /proc/sys/net/ipv4/tcp_available_congestion_control ]]; then
-                    printf '%b  Available CCAs: %s%b\n' \
-                        "$CYAN" \
-                        "$(< /proc/sys/net/ipv4/tcp_available_congestion_control)" \
-                        "$NC"
-                fi
+                [[ -r /proc/sys/net/ipv4/tcp_available_congestion_control ]] && \
+                    printf '%b  Available CCAs: %s%b\n' "$CYAN" \
+                    "$(< /proc/sys/net/ipv4/tcp_available_congestion_control)" "$NC"
             else
                 printf '%b  Note: CCA support depends on your macOS iperf3 build.%b\n' \
                     "$YELLOW" "$NC"
             fi
-            read -r -p "  CCA [kernel default]: " cca </dev/tty
-            cca="${cca:-}"
+            read -r -p "  CCA [kernel default]: " cca </dev/tty; cca="${cca:-}"
             while true; do
                 read -r -p "  Window size (e.g. 256K, empty=default): " win </dev/tty
                 win="${win:-}"
@@ -1436,39 +1217,19 @@ configure_client_streams() {
             done
             while true; do
                 read -r -p "  MSS (e.g. 1460, empty=default): " mss </dev/tty
-                mss="${mss:-}"
-                [[ -z "$mss" ]] && break
-                if [[ "$mss" =~ ^[0-9]+$ ]] && \
-                   (( 10#$mss >= 512 && 10#$mss <= 9000 )); then
-                    break
-                fi
+                mss="${mss:-}"; [[ -z "$mss" ]] && break
+                [[ "$mss" =~ ^[0-9]+$ ]] && (( 10#$mss >= 512 && 10#$mss <= 9000 )) && break
                 printf '%b\n' "${RED}  Enter 512-9000 or press Enter to skip.${NC}"
             done
         fi
-        S_CCA+=("$cca")
-        S_WINDOW+=("$win")
-        S_MSS+=("$mss")
+        S_CCA+=("$cca"); S_WINDOW+=("$win"); S_MSS+=("$mss")
 
-        # ── Bind source IP ────────────────────────────────────────────────────
-        # Rules:
-        #   - User MUST provide a bind IP — skipping is not allowed
-        #   - Session default (dbind) is NOT used or shown
-        #   - Valid inputs:
-        #       'list'   → print interface table, re-prompt
-        #       0        → auto (no explicit bind) — the only way to skip
-        #       1..N     → select interface #N from the table
-        #       x.x.x.x  → direct IP entry
-        #   - Interface table is shown automatically on first prompt
-        #     so the user always has a reference without typing 'list'
         local bip=""
         local _bind_table_shown=0
-
         echo ""
         printf '%b\n' "${CYAN}  -- Bind Source IP --${NC}"
         printf '%b\n' \
-            "  Enter an IP, interface ${BOLD}#${NC} from the table, '${BOLD}list${NC}' to refresh, or '${BOLD}0${NC}' for auto."
-
-        # Show the interface table automatically the first time
+            "  Enter an IP, interface ${BOLD}#${NC} from table, '${BOLD}list${NC}' to show table, or '${BOLD}0${NC}' for auto."
         echo ""
         get_interface_list
         show_interface_table
@@ -1481,182 +1242,117 @@ configure_client_streams() {
                 _bind_raw </dev/tty
             _bind_raw="${_bind_raw:-}"
 
-            # ── Empty input → not allowed, must select ────────────────────────
             if [[ -z "$_bind_raw" ]]; then
                 printf '%b\n' \
                     "${RED}  A bind IP is required. Enter an IP, interface number, or 0 for auto.${NC}"
                 continue
             fi
 
-            # ── 'list' keyword → refresh and reprint table ────────────────────
             local _bind_lower
             _bind_lower=$(printf '%s' "$_bind_raw" | tr '[:upper:]' '[:lower:]')
             if [[ "$_bind_lower" == "list" ]]; then
-                echo ""
-                get_interface_list
-                show_interface_table
-                echo ""
-                _bind_table_shown=1
-                continue
+                echo ""; get_interface_list; show_interface_table; echo ""
+                _bind_table_shown=1; continue
             fi
 
-            # ── Numeric input ─────────────────────────────────────────────────
             if [[ "$_bind_raw" =~ ^[0-9]+$ ]]; then
                 local _sel_num=$(( 10#$_bind_raw ))
                 local _total_ifaces=${#IFACE_NAMES[@]}
-
-                # 0 = auto (explicit no-bind)
                 if (( _sel_num == 0 )); then
-                    bip=""
-                    printf '%b\n' "${CYAN}  Auto source address selected.${NC}"
-                    break
+                    bip=""; printf '%b\n' "${CYAN}  Auto source address selected.${NC}"; break
                 fi
-
-                # Valid interface number
                 if (( _sel_num >= 1 && _sel_num <= _total_ifaces )); then
                     local _sel_idx=$(( _sel_num - 1 ))
                     local _sel_ip="${IFACE_IPS[$_sel_idx]}"
                     local _sel_iface="${IFACE_NAMES[$_sel_idx]}"
                     local _sel_state="${IFACE_STATES[$_sel_idx]}"
-
-                    # Reject interfaces with no IPv4 address
                     if [[ "$_sel_ip" == "N/A" || -z "$_sel_ip" ]]; then
                         printf '%b\n' \
-                            "${RED}  ${_sel_iface} has no IPv4 address. Choose another interface or enter an IP.${NC}"
+                            "${RED}  ${_sel_iface} has no IPv4 address. Choose another or enter an IP.${NC}"
                         continue
                     fi
-
-                    # Warn but allow non-up interfaces
-                    if [[ "$_sel_state" != "up" ]]; then
-                        printf '%b\n' \
-                            "${YELLOW}  WARNING: ${_sel_iface} state='${_sel_state}'.${NC}"
-                    fi
-
-                    printf '%b  Bound to: %s → %s%b\n' \
-                        "$GREEN" "$_sel_iface" "$_sel_ip" "$NC"
-                    bip="$_sel_ip"
-                    break
-
+                    [[ "$_sel_state" != "up" ]] && \
+                        printf '%b\n' "${YELLOW}  WARNING: ${_sel_iface} state='${_sel_state}'.${NC}"
+                    printf '%b  Bound to: %s → %s%b\n' "$GREEN" "$_sel_iface" "$_sel_ip" "$NC"
+                    bip="$_sel_ip"; break
                 else
-                    # Out-of-range number
-                    printf '%b\n' \
-                        "${RED}  Invalid number. Enter 0 or 1-${_total_ifaces}.${NC}"
+                    printf '%b\n' "${RED}  Invalid number. Enter 0 or 1-${_total_ifaces}.${NC}"
                     continue
                 fi
             fi
 
-            # ── Direct IP address entry ───────────────────────────────────────
             if validate_ip "$_bind_raw"; then
                 printf '%b  Bind IP set to: %s%b\n' "$GREEN" "$_bind_raw" "$NC"
-                bip="$_bind_raw"
-                break
+                bip="$_bind_raw"; break
             fi
 
-            # ── Unrecognised input ────────────────────────────────────────────
-            printf '%b\n' \
-                "${RED}  Unrecognised input '${_bind_raw}'.${NC}"
-            printf '%b\n' \
-                "${RED}  Enter: IP address | interface number | 'list' | 0 for auto${NC}"
+            printf '%b\n' "${RED}  Unrecognised input '${_bind_raw}'.${NC}"
+            printf '%b\n' "${RED}  Enter: IP address | interface number | 'list' | 0 for auto${NC}"
         done
-
         S_BIND+=("$bip")
 
-        # ── VRF (Linux only) ──────────────────────────────────────────────────
         local vval=""
         if [[ "$OS_TYPE" == "linux" ]]; then
             if [[ -n "$dvrf" ]]; then
-                read -r -p "  VRF [$dvrf]: " vval </dev/tty
-                vval="${vval:-$dvrf}"
+                read -r -p "  VRF [$dvrf]: " vval </dev/tty; vval="${vval:-$dvrf}"
             else
-                read -r -p "  VRF (press Enter for GRT/none): " vval </dev/tty
-                vval="${vval:-}"
+                read -r -p "  VRF (press Enter for GRT/none): " vval </dev/tty; vval="${vval:-}"
             fi
-            if [[ -n "$vval" && $IS_ROOT -eq 0 ]]; then
-                printf '%b\n' \
-                    "${YELLOW}  WARNING: ip vrf exec requires root.${NC}"
-            fi
+            [[ -n "$vval" && $IS_ROOT -eq 0 ]] && \
+                printf '%b\n' "${YELLOW}  WARNING: ip vrf exec requires root.${NC}"
         fi
         S_VRF+=("$vval")
 
-        # ── Network impairment (Linux only) ───────────────────────────────────
         local dly="" jit="" loss=""
         if [[ "$OS_TYPE" == "linux" ]]; then
             echo ""
-            printf '%b\n' \
-                "${CYAN}  -- Network Impairment via tc netem (press Enter to skip each) --${NC}"
-
+            printf '%b\n' "${CYAN}  -- Network Impairment via tc netem (press Enter to skip each) --${NC}"
             while true; do
-                read -r -p "  Delay ms   [skip]: " dly </dev/tty
-                dly="${dly:-}"
+                read -r -p "  Delay ms   [skip]: " dly </dev/tty; dly="${dly:-}"
                 [[ -z "$dly" ]] && break
-                if validate_float "$dly"; then
-                    break
-                fi
+                if validate_float "$dly"; then break; fi
                 printf '%b\n' "${RED}  Invalid. Enter a number e.g. 100${NC}"
             done
-
             while true; do
-                read -r -p "  Jitter ms  [skip]: " jit </dev/tty
-                jit="${jit:-}"
+                read -r -p "  Jitter ms  [skip]: " jit </dev/tty; jit="${jit:-}"
                 [[ -z "$jit" ]] && break
-                if validate_float "$jit"; then
-                    break
-                fi
+                if validate_float "$jit"; then break; fi
                 printf '%b\n' "${RED}  Invalid. Enter a number e.g. 10${NC}"
             done
-
             while true; do
-                read -r -p "  Loss %%     [skip]: " loss </dev/tty
-                loss="${loss:-}"
+                read -r -p "  Loss %%     [skip]: " loss </dev/tty; loss="${loss:-}"
                 [[ -z "$loss" ]] && break
                 if validate_float "$loss"; then
-                    local li
-                    li=$(printf '%.0f' "$loss" 2>/dev/null)
+                    local li; li=$(printf '%.0f' "$loss" 2>/dev/null)
                     if (( li > 100 )); then
-                        printf '%b\n' \
-                            "${RED}  Loss must be between 0 and 100.${NC}"
-                        loss=""
-                        continue
+                        printf '%b\n' "${RED}  Loss must be between 0 and 100.${NC}"
+                        loss=""; continue
                     fi
                     break
                 fi
                 printf '%b\n' "${RED}  Invalid. Enter a number e.g. 0.5${NC}"
             done
-
-            if [[ ( -n "$dly" || -n "$jit" || -n "$loss" ) \
-                  && $IS_ROOT -eq 0 ]]; then
-                printf '%b\n' \
-                    "${YELLOW}  WARNING: tc netem requires root privileges.${NC}"
-            fi
+            [[ ( -n "$dly" || -n "$jit" || -n "$loss" ) && $IS_ROOT -eq 0 ]] && \
+                printf '%b\n' "${YELLOW}  WARNING: tc netem requires root privileges.${NC}"
         else
             printf '%b\n' \
                 "${YELLOW}  -- Network impairment (tc netem) not available on macOS --${NC}"
         fi
-        S_DELAY+=("$dly")
-        S_JITTER+=("$jit")
-        S_LOSS+=("$loss")
+        S_DELAY+=("$dly"); S_JITTER+=("$jit"); S_LOSS+=("$loss")
 
-        # ── FQ socket pacing (Linux only) ─────────────────────────────────────
         local nofq=0
         if [[ "$OS_TYPE" == "linux" ]]; then
-            if (( NOFQ_SUPPORTED )); then
-                local nfi
-                read -r -p "  Disable FQ socket pacing? [no]: " nfi </dev/tty
+            (( NOFQ_SUPPORTED )) && {
+                local nfi; read -r -p "  Disable FQ socket pacing? [no]: " nfi </dev/tty
                 [[ "$nfi" =~ ^[Yy] ]] && nofq=1
-            fi
+            }
         fi
         S_NOFQ+=("$nofq")
 
-        # ── Initialise per-stream state ───────────────────────────────────────
-        S_LOGFILE+=("")
-        S_SCRIPT+=("")
-        S_START_TS+=(0)
-        S_STATUS_CACHE+=("STARTING")
-        S_ERROR_MSG+=("")
-        S_FINAL_SENDER_BW+=("")
-        S_FINAL_RECEIVER_BW+=("")
+        S_LOGFILE+=(""); S_SCRIPT+=(""); S_START_TS+=(0)
+        S_STATUS_CACHE+=("STARTING"); S_ERROR_MSG+=("")
+        S_FINAL_SENDER_BW+=(""); S_FINAL_RECEIVER_BW+=("")
     done
-
     STREAM_COUNT="$num"
 }
 
@@ -1752,7 +1448,6 @@ build_server_command() {
     [[ -n "${SRV_BIND[$idx]}" ]] && cmd+=" -B ${SRV_BIND[$idx]}"
     (( SRV_ONEOFF[$idx] )) && cmd+=" -1"
     cmd+=" -i 1"
-    # Flush output after every interval line so the log is readable in real time
     (( FORCEFLUSH_SUPPORTED )) && cmd+=" --forceflush"
     printf '%s' "$cmd"
 }
@@ -1780,10 +1475,8 @@ build_client_command() {
     [[ -n "${S_MSS[$idx]}"    ]] && cmd+=" -M ${S_MSS[$idx]}"
     [[ -n "${S_BIND[$idx]}"   ]] && cmd+=" -B ${S_BIND[$idx]}"
     if [[ "$OS_TYPE" == "linux" ]]; then
-        (( S_NOFQ[$idx] )) && (( NOFQ_SUPPORTED )) && \
-            cmd+=" --no-fq-socket-pacing"
+        (( S_NOFQ[$idx] )) && (( NOFQ_SUPPORTED )) && cmd+=" --no-fq-socket-pacing"
     fi
-    # Flush output after every interval line so the log is readable in real time
     (( FORCEFLUSH_SUPPORTED )) && cmd+=" --forceflush"
     printf '%s' "$cmd"
 }
@@ -1796,7 +1489,6 @@ write_launch_script() {
 
 launch_servers() {
     SERVER_PIDS=()
-    # Reset state and BW cache arrays for clean run
     SRV_PREV_STATE=()
     SRV_BW_CACHE=()
     local i
@@ -1804,14 +1496,11 @@ launch_servers() {
         local sn=$(( i + 1 )) sf="${TMPDIR}/server_${sn}.sh" lf="${TMPDIR}/server_${sn}.log"
         if ! write_launch_script "$sf" "$(build_server_command "$i")"; then
             printf '%b\n' "${RED}  [ERROR] Cannot write script for server ${sn}.${NC}"
-            SERVER_PIDS+=(0)
-            SRV_LOGFILE[$i]="$lf"
-            SRV_PREV_STATE+=("")
-            SRV_BW_CACHE+=("---")
+            SERVER_PIDS+=(0); SRV_LOGFILE[$i]="$lf"
+            SRV_PREV_STATE+=(""); SRV_BW_CACHE+=("---")
             continue
         fi
-        SRV_SCRIPT[$i]="$sf"
-        SRV_LOGFILE[$i]="$lf"
+        SRV_SCRIPT[$i]="$sf"; SRV_LOGFILE[$i]="$lf"
         bash "$sf" > "$lf" 2>&1 &
         local pid=$!
         SERVER_PIDS+=("$pid")
@@ -1861,16 +1550,6 @@ wait_for_servers() {
     done; return $(( 1 - all_ok ))
 }
 
-# =============================================================================
-# SECTION 10b — NETEM (FIXED)
-# =============================================================================
-# Fix: resolve the outbound interface per stream target using ip route get.
-# Skip loopback interfaces (lo, lo0, any iface starting with lo).
-# Track applied interfaces in NETEM_IFACES for cleanup.
-# If the resolved interface is loopback, warn and skip — netem cannot be
-# applied to the loopback interface.
-# =============================================================================
-
 apply_netem() {
     [[ "$OS_TYPE" == "macos" ]] && return 0
     NETEM_IFACES=()
@@ -1878,28 +1557,22 @@ apply_netem() {
     for (( i=0; i<STREAM_COUNT; i++ )); do
         local dly="${S_DELAY[$i]:-}" jit="${S_JITTER[$i]:-}" loss="${S_LOSS[$i]:-}"
         [[ -z "$dly" && -z "$jit" && -z "$loss" ]] && continue
-
         if (( IS_ROOT == 0 )); then
-            printf '%b\n' "${YELLOW}  WARNING: tc netem skipped for stream $((i+1)) -- not root.${NC}"
-            continue
+            printf '%b\n' "${YELLOW}  WARNING: tc netem skipped for stream $((i+1)) -- not root.${NC}"; continue
         fi
-
         local oif=""
         if command -v ip >/dev/null 2>&1; then
             oif=$(ip route get "${S_TARGET[$i]}" 2>/dev/null \
                 | grep -oE '\bdev [^ ]+' | awk '{print $2}' | head -1)
         fi
-
         if [[ -z "$oif" ]]; then
             printf '%b\n' "${YELLOW}  WARNING: cannot resolve route for ${S_TARGET[$i]} -- netem skipped for stream $((i+1)).${NC}"
             continue
         fi
-
         if [[ "$oif" == lo || "$oif" == lo0 || "$oif" =~ ^lo[0-9] ]]; then
             printf '%b\n' "${YELLOW}  WARNING: stream $((i+1)) routes via loopback (${oif}) -- netem skipped.${NC}"
             continue
         fi
-
         local already_applied=0
         local applied_iface
         for applied_iface in "${NETEM_IFACES[@]}"; do
@@ -1910,25 +1583,19 @@ apply_netem() {
                 "$CYAN" "$oif" "$((i+1))" "$NC"
             continue
         fi
-
         tc qdisc del dev "$oif" root 2>/dev/null || true
-
-        # Build netem command — jitter can be applied without delay
         local nc="tc qdisc add dev ${oif} root netem"
         if [[ -n "$dly" && -n "$jit" ]]; then
             nc+=" delay ${dly}ms ${jit}ms"
         elif [[ -n "$dly" ]]; then
             nc+=" delay ${dly}ms"
         elif [[ -n "$jit" ]]; then
-            # jitter without delay: apply as delay 0ms Xms
             nc+=" delay 0ms ${jit}ms"
         fi
         [[ -n "$loss" ]] && nc+=" loss ${loss}%"
-
         if bash -c "$nc" 2>/dev/null; then
             printf '%b[NETEM  ]%b  dev %-12s  delay=%s jitter=%s loss=%s\n' \
-                "$GREEN" "$NC" "$oif" \
-                "${dly:-0}ms" "${jit:-0}ms" "${loss:-0}%"
+                "$GREEN" "$NC" "$oif" "${dly:-0}ms" "${jit:-0}ms" "${loss:-0}%"
             NETEM_IFACES+=("$oif")
         else
             printf '%b\n' "${RED}  WARNING: tc netem failed on ${oif} for stream $((i+1)).${NC}"
@@ -1989,7 +1656,6 @@ _check_pid_tcp_connected_linux() {
     local rem_hex_port; rem_hex_port=$(port_to_hex "$target_port")
     [[ -z "$rem_hex_ip" || -z "$rem_hex_port" ]] && return 1
     local target_field="${rem_hex_ip}:${rem_hex_port}"
-
     local tcp_file="/proc/${pid}/net/tcp"
     if [[ -r "$tcp_file" ]]; then
         if awk -v tgt="$target_field" '
@@ -1997,7 +1663,6 @@ _check_pid_tcp_connected_linux() {
             END { exit (found ? 0 : 1) }
         ' "$tcp_file" 2>/dev/null; then return 0; fi
     fi
-
     local tcp6_file="/proc/${pid}/net/tcp6"
     if [[ -r "$tcp6_file" ]]; then
         if awk -v port=":${rem_hex_port}" '
@@ -2005,7 +1670,6 @@ _check_pid_tcp_connected_linux() {
             END { exit (found ? 0 : 1) }
         ' "$tcp6_file" 2>/dev/null; then return 0; fi
     fi
-
     if ss -tnp 2>/dev/null | grep -qE "pid=${pid},[0-9]+" 2>/dev/null; then
         local conn_line
         conn_line=$(ss -tnp 2>/dev/null | grep -E "pid=${pid}," | grep "ESTAB")
@@ -2014,7 +1678,6 @@ _check_pid_tcp_connected_linux() {
             [[ "$target_ip" == "127.0.0.1" || "$target_ip" == "::1" ]] && return 0
         fi
     fi
-
     if [[ -d "/proc/${pid}/fd" ]]; then
         local socket_inodes=()
         local fd_link
@@ -2070,10 +1733,8 @@ probe_client_status() {
     local proto="${S_PROTO[$idx]:-TCP}"
     local cur="${S_STATUS_CACHE[$idx]:-}"
 
-    # Once terminal — do not re-evaluate, but capture final BW if not done yet
     if [[ "$cur" == "DONE" ]]; then
-        _capture_final_bw "$idx"
-        return
+        _capture_final_bw "$idx"; return
     fi
     [[ "$cur" == "FAILED" ]] && return
 
@@ -2091,18 +1752,14 @@ probe_client_status() {
             S_STATUS_CACHE[$idx]="FAILED"; S_ERROR_MSG[$idx]="$err"; return
         fi
         if [[ -f "$lf" ]] && grep -qE 'sender|receiver' "$lf" 2>/dev/null; then
-            S_STATUS_CACHE[$idx]="DONE"
-            _capture_final_bw "$idx"
-            return
+            S_STATUS_CACHE[$idx]="DONE"; _capture_final_bw "$idx"; return
         fi
         if [[ -f "$lf" && -s "$lf" ]]; then
             S_STATUS_CACHE[$idx]="FAILED"
             S_ERROR_MSG[$idx]=$(tail -3 "$lf" 2>/dev/null | tr '\n' ' ' | sed 's/^[[:space:]]*//')
             return
         fi
-        S_STATUS_CACHE[$idx]="DONE"
-        _capture_final_bw "$idx"
-        return
+        S_STATUS_CACHE[$idx]="DONE"; _capture_final_bw "$idx"; return
     fi
 
     if [[ -f "$lf" && -s "$lf" ]]; then
@@ -2155,21 +1812,17 @@ probe_server_status() {
     local lf="${SRV_LOGFILE[$idx]:-}"
     local port="${SRV_PORT[$idx]:-}"
 
-    # ── Process dead ─────────────────────────────────────────────────────────
     [[ "$pid" == "0" ]] && { printf '%s' 'FAILED'; return; }
     kill -0 "$pid" 2>/dev/null || { printf '%s' 'DONE'; return; }
 
-    # ── Determine current connection state ───────────────────────────────────
     local current_state="STARTING"
-
     if [[ -n "$port" ]]; then
         if [[ "$OS_TYPE" == "macos" ]]; then
             if lsof -iTCP:"$port" 2>/dev/null | grep -q "ESTABLISHED"; then
                 current_state="CONNECTED"
             elif lsof -iTCP:"$port" -sTCP:LISTEN >/dev/null 2>&1; then
                 if [[ -f "$lf" && -s "$lf" ]] && \
-                   grep -qiE 'accepted connection|connected|bits/sec' \
-                   "$lf" 2>/dev/null; then
+                   grep -qiE 'accepted connection|connected|bits/sec' "$lf" 2>/dev/null; then
                     current_state="RUNNING"
                 else
                     current_state="LISTENING"
@@ -2182,8 +1835,7 @@ probe_server_status() {
                 current_state="CONNECTED"
             elif ss -tlnp 2>/dev/null | grep -qE ":${port}([[:space:]]|$)"; then
                 if [[ -f "$lf" && -s "$lf" ]] && \
-                   grep -qiE 'accepted connection|connected|bits/sec' \
-                   "$lf" 2>/dev/null; then
+                   grep -qiE 'accepted connection|connected|bits/sec' "$lf" 2>/dev/null; then
                     current_state="RUNNING"
                 else
                     current_state="LISTENING"
@@ -2192,29 +1844,19 @@ probe_server_status() {
         fi
     fi
 
-    if [[ -z "$current_state" || "$current_state" == "STARTING" ]]; then
-        [[ ! -f "$lf" || ! -s "$lf" ]] && { printf '%s' 'STARTING'; return; }
-        grep -qiE 'accepted connection|connected' "$lf" 2>/dev/null \
-            && current_state="RUNNING" \
-            || { grep -qi 'server listening\|listening on' "$lf" 2>/dev/null \
-                && current_state="LISTENING" \
-                || current_state="STARTING"; }
+    if [[ "$current_state" == "STARTING" ]]; then
+        if [[ -f "$lf" && -s "$lf" ]]; then
+            grep -qiE 'accepted connection|connected' "$lf" 2>/dev/null \
+                && current_state="RUNNING" \
+                || { grep -qi 'server listening\|listening on' "$lf" 2>/dev/null \
+                    && current_state="LISTENING" || current_state="STARTING"; }
+        fi
     fi
 
-    # ── Bandwidth state management ────────────────────────────────────────────
-    # Retrieve the previous state stored in SRV_PREV_STATE array.
-    # When the state transitions FROM CONNECTED back to RUNNING or LISTENING
-    # it means the client disconnected.  Reset the bandwidth display to ---
-    # so stale values from the previous connection are not shown.
     local prev_state="${SRV_PREV_STATE[$idx]:-}"
-
-    if [[ "$prev_state" == "CONNECTED" && \
-          "$current_state" != "CONNECTED" ]]; then
-        # Client has disconnected — clear the cached bandwidth
+    if [[ "$prev_state" == "CONNECTED" && "$current_state" != "CONNECTED" ]]; then
         SRV_BW_CACHE[$idx]="---"
     fi
-
-    # Store current state for the next probe cycle
     SRV_PREV_STATE[$idx]="$current_state"
 
     printf '%s' "$current_state"
@@ -2224,59 +1866,28 @@ probe_server_status() {
 # SECTION 12 — DASHBOARD
 # =============================================================================
 
-# =============================================================================
-# PATCH FOR v8.1 — replaces calculate_frame_lines, adds _has_dynamic_panels,
-# replaces run_dashboard
-# =============================================================================
-
 calculate_frame_lines() {
-    # Fixed frame line count — must exactly match _render_client_frame output:
-    #   line 1   bline '='          top border
-    #   line 2   bcenter            title
-    #   line 3   bline '='          title border
-    #   line 4   bleft counters     active/connected/done/failed/elapsed
-    #   line 5   print_separator    ---
-    #   line 6   bleft col header   # Proto Target ...
-    #   line 7   print_separator    ---
-    #   lines 8..(7+N)  data rows   one per stream
-    #   line 8+N  print_separator   ---
-    #   line 9+N  bleft hint        Ctrl+C hint
-    #   line 10+N print_separator   ---
-    # Total: 10 + N
     printf '%d' $(( 10 + ${1:-0} ))
 }
 
-# ---------------------------------------------------------------------------
-# _has_dynamic_panels
-#
-# Returns 0 (true) if at least one stream has reached DONE or FAILED status,
-# meaning the completed/failed panels will be rendered below the fixed frame.
-# Returns 1 (false) when all streams are still active.
-#
-# Used by run_dashboard to gate the \033[J (erase to end of screen) sequence
-# so it is only emitted when there is actually dynamic content below the
-# fixed frame to clear between ticks.
-# ---------------------------------------------------------------------------
-_has_dynamic_panels() {
-    local i
+_count_completed_panel_lines() {
+    local done_count=0 i
     for (( i=0; i<STREAM_COUNT; i++ )); do
-        [[ "${S_STATUS_CACHE[$i]}" == "DONE"   ]] && return 0
-        [[ "${S_STATUS_CACHE[$i]}" == "FAILED" ]] && return 0
+        [[ "${S_STATUS_CACHE[$i]}" == "DONE" ]] && (( done_count++ ))
     done
-    return 1
+    (( done_count == 0 )) && { printf '%d' 0; return; }
+    printf '%d' $(( 6 + done_count ))
 }
 
-# ---------------------------------------------------------------------------
-# _render_completed_panel
-#
-# Renders a separate table BELOW the live dashboard showing all streams
-# that have reached DONE status.  Displays sender and receiver bandwidth
-# captured at completion time.  This panel is printed AFTER the main
-# dashboard frame and grows dynamically as more streams finish.
-#
-# Called from _render_client_frame — printed outside the fixed frame block
-# so it does not affect cursor positioning.
-# ---------------------------------------------------------------------------
+_count_failed_panel_lines() {
+    local fail_count=0 i
+    for (( i=0; i<STREAM_COUNT; i++ )); do
+        [[ "${S_STATUS_CACHE[$i]}" == "FAILED" ]] && (( fail_count++ ))
+    done
+    (( fail_count == 0 )) && { printf '%d' 0; return; }
+    printf '%d' $(( 6 + fail_count ))
+}
+
 _render_completed_panel() {
     local done_count=0 i
     for (( i=0; i<STREAM_COUNT; i++ )); do
@@ -2303,17 +1914,9 @@ _render_completed_panel() {
             "$sn" "${S_PROTO[$i]}" "$tgt" "${S_PORT[$i]}")
         bleft " ${pfx}${GREEN}$(printf '%-14s' "$sbw")${NC}  ${CYAN}$(printf '%-14s' "$rbw")${NC}"
     done
-
     printf '+%s+\033[K\n' "$(rpt '=' $(( COLS - 2 )))"
 }
 
-# ---------------------------------------------------------------------------
-# _render_failed_panel
-#
-# Renders a separate table BELOW the live dashboard (and below the completed
-# panel if present) showing all streams that reached FAILED status with a
-# human-readable error message.
-# ---------------------------------------------------------------------------
 _render_failed_panel() {
     local fail_count=0 i
     for (( i=0; i<STREAM_COUNT; i++ )); do
@@ -2334,7 +1937,6 @@ _render_failed_panel() {
         local tgt="${S_TARGET[$i]:-?}"
         (( ${#tgt} > 14 )) && tgt="${tgt:0:13}~"
         local err="${S_ERROR_MSG[$i]:-Unknown error}"
-        # Truncate error to fit in box
         local max_err=$(( COLS - 34 ))
         (( ${#err} > max_err )) && err="${err:0:$((max_err-3))}..."
         local pfx
@@ -2342,7 +1944,6 @@ _render_failed_panel() {
             "$sn" "${S_PROTO[$i]}" "$tgt" "${S_PORT[$i]}")
         bleft " ${pfx}${RED}${err}${NC}"
     done
-
     printf '+%s+\033[K\n' "$(rpt '=' $(( COLS - 2 )))"
 }
 
@@ -2363,7 +1964,7 @@ _render_client_frame() {
     local efmt; efmt=$(format_seconds $(( now - fts )))
 
     bline '='
-    bcenter "${BOLD}${CYAN}iperf3 Traffic Manager -- Live Dashboard${NC}"
+    bcenter "${BOLD}${CYAN}iperf3 Traffic Streams -- Live Dashboard${NC}"
     bline '='
     bleft "  $(printf 'Active:%-2d  Connected:%-2d  Done:%-2d  Failed:%-2d  Elapsed:%s' \
         "$act" "$nc" "$nd" "$nf" "$efmt")"
@@ -2426,9 +2027,6 @@ _render_client_frame() {
     print_separator
     bleft "  ${YELLOW}Ctrl+C to stop all streams${NC}"
     print_separator
-    # NOTE: _render_completed_panel and _render_failed_panel are NOT called
-    # here. They are called by run_dashboard after \033[J so they can be
-    # erased and redrawn cleanly on every tick.
 }
 
 _render_server_frame() {
@@ -2439,7 +2037,7 @@ _render_server_frame() {
     done
 
     bline '='
-    bcenter "${BOLD}${CYAN}iperf3 Traffic Manager -- Server Dashboard${NC}"
+    bcenter "${BOLD}${CYAN}iperf3 Traffic Streams -- Server Dashboard${NC}"
     bline '='
     bleft "  $(printf 'Listeners active: %d / %d' "$running" "$SERVER_COUNT")"
     print_separator
@@ -2449,15 +2047,8 @@ _render_server_frame() {
 
     for (( i=0; i<SERVER_COUNT; i++ )); do
         local sn=$(( i + 1 )) lf="${SRV_LOGFILE[$i]:-}"
-
-        # Get current status (also updates SRV_PREV_STATE and SRV_BW_CACHE)
         local st; st=$(probe_server_status "$i")
 
-        # ── Bandwidth logic ───────────────────────────────────────────────────
-        # Only parse live bandwidth when a client is actively connected.
-        # When state is RUNNING/LISTENING (client disconnected or not yet
-        # connected), display the cached value which probe_server_status
-        # resets to --- on disconnect.
         local bw
         if [[ "$st" == "CONNECTED" || "$st" == "RUNNING" ]]; then
             local live_bw
@@ -2466,33 +2057,24 @@ _render_server_frame() {
                 bw="$live_bw"
                 SRV_BW_CACHE[$i]="$live_bw"
             else
-                # No new live data — use cache (may be --- if just reset)
                 bw="${SRV_BW_CACHE[$i]:----}"
             fi
         else
-            # LISTENING or STARTING — no client, show ---
             bw="---"
             SRV_BW_CACHE[$i]="---"
         fi
 
         local sb sc
         case "$st" in
-            CONNECTED) sb="CONNECTED" sc="$GREEN"  ;;
-            RUNNING)   sb="RUNNING"   sc="$CYAN"   ;;
-            LISTENING) sb="LISTENING" sc="$BLUE"   ;;
-            STARTING)  sb="STARTING"  sc="$YELLOW" ;;
-            DONE)      sb="DONE"      sc="$NC"     ;;
-            FAILED)    sb="FAILED"    sc="$RED"    ;;
+            CONNECTED) sb="CONNECTED" sc="$GREEN"  ;; RUNNING)  sb="RUNNING"  sc="$CYAN"   ;;
+            LISTENING) sb="LISTENING" sc="$BLUE"   ;; STARTING) sb="STARTING" sc="$YELLOW" ;;
+            DONE)      sb="DONE"      sc="$NC"     ;; FAILED)   sb="FAILED"   sc="$RED"    ;;
             *)         sb="$st"       sc="$NC"     ;;
         esac
-
-        local vrf_disp="${SRV_VRF[$i]:-GRT}"
-        [[ "$OS_TYPE" == "macos" ]] && vrf_disp="N/A"
-
+        local vrf_disp="${SRV_VRF[$i]:-GRT}"; [[ "$OS_TYPE" == "macos" ]] && vrf_disp="N/A"
         local pfx
         pfx=$(printf '%-3d  %-6s  %-16s  %-10s  %-12s  ' \
-            "$sn" "${SRV_PORT[$i]}" "${SRV_BIND[$i]:-0.0.0.0}" \
-            "$vrf_disp" "$bw")
+            "$sn" "${SRV_PORT[$i]}" "${SRV_BIND[$i]:-0.0.0.0}" "$vrf_disp" "$bw")
         bleft " ${pfx}${sc}${sb}${NC}"
     done
 
@@ -2501,15 +2083,6 @@ _render_server_frame() {
     print_separator
 }
 
-# ---------------------------------------------------------------------------
-# run_dashboard  <mode>
-#
-# Renders the live dashboard using the pre-reserve overwrite technique.
-# The fixed frame (FRAME_LINES lines) is overwritten in place every second.
-# Dynamic panels (completed/failed) are appended below the fixed frame and
-# erased with \033[J only when they contain content.
-# ---------------------------------------------------------------------------
-
 run_dashboard() {
     local mode="${1:-client}"
     local count
@@ -2517,27 +2090,14 @@ run_dashboard() {
     FRAME_LINES=$(calculate_frame_lines "$count")
     _PREV_DYNAMIC_LINES=0
 
-    # ── Pre-reserve exactly FRAME_LINES blank lines ───────────────────────────
-    # We only reserve space for the fixed frame.  Dynamic panels grow below
-    # the fixed frame and are cleared with \033[J on each tick.
-    # Pre-reserving more than FRAME_LINES causes the cursor-up after
-    # pre-reserve to overshoot the viewport top on short terminals, which
-    # triggers terminal scroll and produces duplicate output.
     local k
     for (( k=0; k<FRAME_LINES; k++ )); do printf '\n'; done
-
-    # Move cursor back to the top of the reserved block so tick 1 renders
-    # exactly over the blank lines we just printed.
     printf '\033[%dA' "$FRAME_LINES"
-
-    printf '\033[?25l'   # hide cursor during rendering
+    printf '\033[?25l'
 
     local first_tick=1
 
     while true; do
-        # ── Probe status before rendering ─────────────────────────────────────
-        # Update all stream statuses first so the frame reflects the latest
-        # state including any DONE/FAILED transitions on this tick.
         if [[ "$mode" != "server" ]]; then
             local j
             for (( j=0; j<STREAM_COUNT; j++ )); do
@@ -2545,30 +2105,20 @@ run_dashboard() {
             done
         fi
 
-        # ── Move cursor to the top of the last rendered block ─────────────────
-        # On tick 1 the cursor is already at the top from the pre-reserve above.
-        # From tick 2 onwards we move up by:
-        #   FRAME_LINES                (fixed frame from last tick)
-        # + _PREV_DYNAMIC_LINES        (dynamic panels from last tick)
         if (( first_tick == 0 )); then
             local move_up=$(( FRAME_LINES + _PREV_DYNAMIC_LINES ))
             printf '\033[%dA' "$move_up"
         fi
         first_tick=0
 
-        # ── Render fixed frame ────────────────────────────────────────────────
         if [[ "$mode" == "server" ]]; then
             _render_server_frame
         else
             _render_client_frame
         fi
 
-        # ── Erase from cursor to end of screen ───────────────────────────────
-        # This clears stale dynamic panel rows from the previous tick so the
-        # updated panels render on a clean surface.
         printf '\033[J'
 
-        # ── Render dynamic panels (client mode only) ──────────────────────────
         local completed_lines=0 failed_lines=0
         if [[ "$mode" != "server" ]]; then
             completed_lines=$(_count_completed_panel_lines)
@@ -2577,10 +2127,8 @@ run_dashboard() {
             (( failed_lines    > 0 )) && _render_failed_panel
         fi
 
-        # ── Store dynamic line count for next tick's cursor-up ────────────────
         _PREV_DYNAMIC_LINES=$(( completed_lines + failed_lines ))
 
-        # ── Check whether all processes have finished ─────────────────────────
         local any=0
         if [[ "$mode" == "server" ]]; then
             local j
@@ -2596,18 +2144,10 @@ run_dashboard() {
             done
         fi
 
-        # All processes finished.  The render above already shows the final
-        # state with the completed/failed panels.  Break immediately — no
-        # second render needed.
         (( any == 0 )) && break
-
         sleep 1
     done
 
-    # Restore cursor visibility.
-    # No echo "" here — the dynamic panels already ended at the correct
-    # terminal position.  The caller (run_client_mode etc.) will print
-    # the final results table immediately below.
     printf '\033[?25h'
     printf '\n'
 }
@@ -2769,15 +2309,13 @@ run_server_mode() {
 
 run_client_mode() {
     echo ""; print_header "Client Mode"; echo ""
-    select_bind_interface "client"
-    local bind_ip="$SELECTED_IP" vrf="$SELECTED_VRF"; echo ""
     local n
     while true; do
         read -r -p "  How many streams? [1]: " n </dev/tty; n="${n:-1}"
         [[ "$n" =~ ^[0-9]+$ ]] && (( 10#$n >= 1 && 10#$n <= 64 )) && break
         printf '%b\n' "${RED}  Enter a positive integer (1-64).${NC}"
     done
-    configure_client_streams "$n" "$bind_ip" "$vrf"
+    configure_client_streams "$n" "" ""
     show_stream_summary "client"
     confirm_proceed "Launch ${n} stream(s)?" || return
     apply_netem; echo ""; launch_clients
@@ -2874,7 +2412,7 @@ run_loopback_mode() {
 show_main_menu() {
     clear; echo ""
     bline '='; bempty
-    bcenter "${BOLD}${CYAN}iperf3 Multi-Stream Traffic Manager  v8.0${NC}"
+    bcenter "${BOLD}${CYAN}iperf3 Traffic Streams  v8.1${NC}"
     bempty; bline '='
 
     if [[ "$OS_TYPE" == "macos" ]]; then
@@ -2918,7 +2456,8 @@ main_menu() {
                 read -r -p "  Press Enter to return to menu..." </dev/tty
                 SERVER_COUNT=0; SERVER_PIDS=()
                 SRV_PORT=(); SRV_BIND=(); SRV_VRF=()
-                SRV_ONEOFF=(); SRV_LOGFILE=(); SRV_SCRIPT=() ;;
+                SRV_ONEOFF=(); SRV_LOGFILE=(); SRV_SCRIPT=()
+                SRV_PREV_STATE=(); SRV_BW_CACHE=() ;;
             3)
                 build_vrf_maps; get_interface_list; run_client_mode; echo ""
                 read -r -p "  Press Enter to return to menu..." </dev/tty
@@ -2927,7 +2466,8 @@ main_menu() {
                 build_vrf_maps; get_interface_list; run_loopback_mode; echo ""
                 read -r -p "  Press Enter to return to menu..." </dev/tty
                 STREAM_COUNT=0; SERVER_COUNT=0
-                STREAM_PIDS=(); SERVER_PIDS=(); NETEM_IFACES=() ;;
+                STREAM_PIDS=(); SERVER_PIDS=(); NETEM_IFACES=()
+                SRV_PREV_STATE=(); SRV_BW_CACHE=() ;;
             5)
                 echo ""; show_dscp_table
                 read -r -p "  Press Enter to return to menu..." </dev/tty ;;
