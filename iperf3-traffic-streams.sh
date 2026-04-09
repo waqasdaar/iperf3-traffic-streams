@@ -2077,14 +2077,6 @@ PROBE_EOF
 }
 
 # ---------------------------------------------------------------------------
-# _preflight_traceroute_vrf  <target>  <vrf_exec_prefix>
-#
-# Runs traceroute inside the VRF context defined by vrf_exec_prefix.
-# Returns normalised "HOP|HOST|RTT" lines or "UNAVAILABLE".
-# ---------------------------------------------------------------------------
-
-
-# ---------------------------------------------------------------------------
 # _find_traceroute_bin
 #
 # Locates the traceroute or tracepath binary by searching the current PATH
@@ -2099,6 +2091,7 @@ PROBE_EOF
 #         /usr/bin/tracepath|tracepath
 #         UNAVAILABLE
 # ---------------------------------------------------------------------------
+
 _find_traceroute_bin() {
     # PATH-based search first
     local bin_in_path
@@ -2177,31 +2170,93 @@ _resolve_stream_vrf_for_target() {
 }
 
 # ---------------------------------------------------------------------------
+# _preflight_sudo_warmup  <vrf_name>
+#
+# Pre-warms the sudo credential cache before traceroute runs inside $().
+#
+# Problem:
+#   When _preflight_traceroute_vrf runs inside $(...)  the subshell has
+#   stdout and stderr captured.  sudo cannot display its password prompt
+#   to the terminal and fails silently, producing empty output.
+#
+# Solution:
+#   Run "sudo -v" interactively against /dev/tty BEFORE the subshell is
+#   created.  This authenticates sudo and caches the credential.
+#   All subsequent sudo calls within the cache timeout (typically 15 min)
+#   succeed without prompting, including those inside $(...).
+#
+#   If the process is already root (IS_ROOT=1) sudo is a no-op and this
+#   function returns immediately.
+#
+#   If sudo is not available the VRF traceroute will be attempted without
+#   it — it will either work (if capabilities allow) or fail gracefully.
+# ---------------------------------------------------------------------------
+
+_preflight_sudo_warmup() {
+    local vrf_name="${1:-}"
+
+    # Root never needs sudo
+    (( IS_ROOT == 1 )) && return 0
+
+    # Only needed on Linux with a VRF configured
+    [[ "$OS_TYPE" != "linux" || -z "$vrf_name" ]] && return 0
+
+    # Check sudo is available
+    command -v sudo >/dev/null 2>&1 || return 0
+
+    # Check whether the credential is already cached (exit 0 = cached)
+    if sudo -n true 2>/dev/null; then
+        # Already authenticated — no prompt needed
+        return 0
+    fi
+
+    # Credential not cached — prompt interactively on the real terminal
+    printf '%b\n' \
+        "${YELLOW}  sudo authentication required for VRF traceroute (ip vrf exec ${vrf_name})${NC}"
+    printf '%b\n' \
+        "${CYAN}  Please enter your sudo password:${NC}"
+
+    # Run sudo -v directly on /dev/tty so the password prompt is visible
+    # even though this function may be called from within a rendering context
+    sudo -v </dev/tty 2>/dev/tty
+    local sudo_rc=$?
+
+    if (( sudo_rc != 0 )); then
+        printf '%b\n' \
+            "${YELLOW}  sudo authentication failed or was cancelled.${NC}"
+        printf '%b\n' \
+            "${YELLOW}  VRF traceroute will be skipped for VRF: ${vrf_name}${NC}"
+        return 1
+    fi
+
+    printf '%b\n' "${GREEN}  sudo credential cached successfully.${NC}"
+    return 0
+}
+
+# ---------------------------------------------------------------------------
 # _preflight_traceroute_vrf  <target>  <vrf_name>
 #
-# Runs traceroute to <target> using the correct command pattern based on
-# the operating system and VRF configuration:
+# Runs traceroute to <target> using the correct command pattern:
 #
-#   Linux + VRF configured:
-#     sudo ip vrf exec <VRF_NAME> traceroute <target>
-#     Uses the VRF name directly from the stream configuration.
-#     sudo is used because ip vrf exec requires CAP_NET_ADMIN.
-#     If the process is already root sudo is a no-op.
+#   Linux + VRF:  sudo ip vrf exec <VRF_NAME> traceroute <target>
+#   Linux + GRT:  traceroute <target>
+#   macOS:        traceroute <target>
 #
-#   Linux + GRT (no VRF):
-#     traceroute <target>
-#     Plain traceroute in the global routing table.
+# Flag compatibility note:
+#   The -n flag (suppress DNS) is NOT used because it is not supported
+#   by all traceroute implementations.  Specifically inetutils-traceroute
+#   (common on Ubuntu/Debian) does not support -n and exits with error:
+#     "invalid option -- 'n'"
+#   The flags used here are supported by all known implementations:
+#     -m 20   maximum 20 hops
+#     -w 2    wait 2 seconds per probe response
+#     -q 1    send 1 probe per hop (faster, less noise)
+#   DNS resolution is left enabled — adds minor latency but is harmless
+#   and avoids the invalid option error entirely.
 #
-#   macOS:
-#     traceroute <target>
-#     No VRF support on macOS — vrf_name is always ignored.
-#
-# Falls back to tracepath if traceroute is not available.
-# Returns normalised "HOP|HOST|RTT" lines or "UNAVAILABLE".
-#
-# Parameters:
-#   $1  target    — destination IP or hostname
-#   $2  vrf_name  — VRF name string or empty string for GRT
+# The sudo credential is assumed to be already cached via
+# _preflight_sudo_warmup before this function is called inside $().
+# stderr is redirected to /dev/tty so sudo messages reach the operator.
 # ---------------------------------------------------------------------------
 
 _preflight_traceroute_vrf() {
@@ -2209,7 +2264,7 @@ _preflight_traceroute_vrf() {
     local vrf_name="${2:-}"
     local tr_out=""
 
-    # ── Locate the binary ─────────────────────────────────────────────────
+    # ── Locate binary ─────────────────────────────────────────────────────
     local bin_info
     bin_info=$(_find_traceroute_bin)
     if [[ "$bin_info" == "UNAVAILABLE" ]]; then
@@ -2220,44 +2275,43 @@ _preflight_traceroute_vrf() {
     tr_bin=$(printf '%s' "$bin_info" | cut -d'|' -f1)
     tr_type=$(printf '%s' "$bin_info" | cut -d'|' -f2)
 
-    # ── Build the command ─────────────────────────────────────────────────
+    # ── Run traceroute ────────────────────────────────────────────────────
     if [[ "$OS_TYPE" == "linux" && -n "$vrf_name" ]]; then
 
-        # ── Linux + VRF: use sudo ip vrf exec VRF-NAME traceroute ────────
-        # This is the canonical approach for VRF-aware traceroute on Linux.
-        # sudo is required for ip vrf exec unless already running as root.
-        # When running as root sudo is a no-op so this is always safe.
+        # ── Linux + VRF: sudo ip vrf exec VRF_NAME traceroute TARGET ─────
+        # stderr to /dev/tty so sudo messages are visible to the operator
         if [[ "$tr_type" == "traceroute" ]]; then
             tr_out=$(sudo ip vrf exec "${vrf_name}" \
-                "${tr_bin}" -m 20 -w 2 -q 1 -n \
-                "${target}" 2>/dev/null | tail -n +2)
+                "${tr_bin}" -m 20 -w 2 -q 1 "${target}" \
+                2>/dev/tty | tail -n +2)
         else
-            # tracepath fallback inside VRF
+            # tracepath does not support -m -w -q flags
             tr_out=$(sudo ip vrf exec "${vrf_name}" \
-                "${tr_bin}" -n \
-                "${target}" 2>/dev/null | tail -n +2)
+                "${tr_bin}" "${target}" \
+                2>/dev/tty | tail -n +2)
         fi
 
     elif [[ "$OS_TYPE" == "linux" ]]; then
 
-        # ── Linux + GRT: plain traceroute ────────────────────────────────
+        # ── Linux + GRT: plain traceroute, no sudo needed ─────────────────
         if [[ "$tr_type" == "traceroute" ]]; then
-            tr_out=$("${tr_bin}" -m 20 -w 2 -q 1 -n \
-                "${target}" 2>/dev/null | tail -n +2)
+            tr_out=$("${tr_bin}" -m 20 -w 2 -q 1 "${target}" \
+                2>/dev/null | tail -n +2)
         else
-            tr_out=$("${tr_bin}" -n \
-                "${target}" 2>/dev/null | tail -n +2)
+            tr_out=$("${tr_bin}" "${target}" \
+                2>/dev/null | tail -n +2)
         fi
 
     else
 
-        # ── macOS: plain traceroute, no VRF support ───────────────────────
+        # ── macOS: plain traceroute ───────────────────────────────────────
+        # macOS traceroute does not support -w but supports -m and -q
         if [[ "$tr_type" == "traceroute" ]]; then
-            tr_out=$("${tr_bin}" -m 20 -w 2 -q 1 \
-                "${target}" 2>/dev/null | tail -n +2)
+            tr_out=$("${tr_bin}" -m 20 -q 1 "${target}" \
+                2>/dev/null | tail -n +2)
         else
-            tr_out=$("${tr_bin}" \
-                "${target}" 2>/dev/null | tail -n +2)
+            tr_out=$("${tr_bin}" "${target}" \
+                2>/dev/null | tail -n +2)
         fi
 
     fi
@@ -2268,24 +2322,58 @@ _preflight_traceroute_vrf() {
     fi
 
     # ── Normalise output to HOP|HOST|RTT lines ────────────────────────────
+    # Handles output from multiple traceroute implementations:
+    #
+    # GNU traceroute / inetutils format:
+    #   1  router.local (192.168.1.1)  0.451 ms  0.151 ms  0.110 ms
+    #   2  * * *
+    #
+    # tracepath format:
+    #   1?: [LOCALHOST]  pmtu 1500
+    #    1:  192.168.1.1  0.451ms
+    #
     printf '%s' "$tr_out" | awk '
     {
         sub(/^[[:space:]]+/, "")
 
-        # Skip blank lines and header/summary lines that start with letters
+        # Skip blank lines
         if (NF == 0) next
-        if ($1 ~ /^[a-zA-Z]/) next
 
+        # Skip tracepath header lines (pmtu, asymm etc.)
+        if ($0 ~ /pmtu|asymm|Resume/) next
+
+        # Skip lines that do not start with a number
+        if ($1 !~ /^[0-9]/) next
+
+        # Remove trailing ? from tracepath hop numbers (e.g. "1?")
+        gsub(/\?$/, "", $1)
         hop = $1
+
         host = "* * *"
         rtt  = "---"
 
         for (i = 2; i <= NF; i++) {
+            # Skip asterisks
+            if ($i == "*") continue
+
             # Match IPv4 address
             if ($i ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/) {
                 host = $i
-                # Look ahead for RTT value
+                # Search forward for RTT value (number followed by ms)
                 for (j = i+1; j <= NF; j++) {
+                    # Handle "0.451ms" (no space before ms)
+                    if ($(j) ~ /^[0-9]+\.[0-9]+ms$/) {
+                        gsub(/ms$/, "", $(j))
+                        rtt = $(j) " ms"
+                        break
+                    }
+                    # Handle "0.451" followed by "ms"
+                    if ($(j) ~ /^[0-9]+\.[0-9]+$/ && \
+                        j+1 <= NF && $(j+1) == "ms") {
+                        rtt = $(j) " ms"
+                        break
+                    }
+                    # Handle standalone float (traceroute standard)
                     if ($(j) ~ /^[0-9]+\.[0-9]+$/) {
                         rtt = $(j) " ms"
                         break
@@ -2293,10 +2381,39 @@ _preflight_traceroute_vrf() {
                 }
                 break
             }
-            # Match hostname (not *, not a bare number, not "ms")
-            if ($i != "*" && $i !~ /^[0-9]+(\.[0-9]+)?$/ && $i !~ /^ms$/) {
+
+            # Match hostname in parentheses e.g. "router.local (192.168.1.1)"
+            if ($i ~ /^\(.*\)$/) {
+                # Extract IP from parentheses
+                gsub(/[()]/, "", $i)
+                if ($i ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/) {
+                    host = $i
+                    for (j = i+1; j <= NF; j++) {
+                        if ($(j) ~ /^[0-9]+\.[0-9]+ms$/) {
+                            gsub(/ms$/, "", $(j))
+                            rtt = $(j) " ms"
+                            break
+                        }
+                        if ($(j) ~ /^[0-9]+\.[0-9]+$/) {
+                            rtt = $(j) " ms"
+                            break
+                        }
+                    }
+                    break
+                }
+            }
+
+            # Match bare hostname (not a number, not ms, not *)
+            if ($i !~ /^[0-9]+(\.[0-9]+)?$/ && \
+                $i !~ /^ms$/ && \
+                $i !~ /^\[/ ) {
                 host = $i
                 for (j = i+1; j <= NF; j++) {
+                    if ($(j) ~ /^[0-9]+\.[0-9]+ms$/) {
+                        gsub(/ms$/, "", $(j))
+                        rtt = $(j) " ms"
+                        break
+                    }
                     if ($(j) ~ /^[0-9]+\.[0-9]+$/) {
                         rtt = $(j) " ms"
                         break
@@ -2518,16 +2635,36 @@ run_preflight_checks() {
         bcenter "${BOLD}Path Discovery — Traceroute${NC}"
         printf '+%s+\n' "$(rpt '=' "$inner")"
 
+        # ── Pre-warm sudo credential once per unique VRF ──────────────────
+        # This MUST happen before any traceroute subshell $(...)  is opened.
+        # Once the credential is cached all subsequent sudo calls in this
+        # shell session succeed without a TTY prompt.
+        local -a sudo_warmed_vrfs=()
+        for (( k=0; k<total_checks; k++ )); do
+            local tgt="${pf_targets[$k]}"
+            [[ "$tgt" =~ ^127\. || "$tgt" == "::1" ]] && continue
+            local vrf="${pf_vrfs[$k]}"
+            [[ -z "$vrf" ]] && continue   # GRT needs no sudo warmup
+
+            # Only warm up each VRF once
+            local _already_warmed=0
+            local _wv
+            for _wv in "${sudo_warmed_vrfs[@]}"; do
+                [[ "$_wv" == "$vrf" ]] && _already_warmed=1 && break
+            done
+            (( _already_warmed )) && continue
+
+            # Warm up sudo for this VRF
+            if _preflight_sudo_warmup "$vrf"; then
+                sudo_warmed_vrfs+=("$vrf")
+            fi
+        done
+
         for (( k=0; k<total_checks; k++ )); do
             local tgt="${pf_targets[$k]}"
             [[ "$tgt" =~ ^127\. || "$tgt" == "::1" ]] && continue
 
-            # ── VRF for this check ────────────────────────────────────────
-            # Use the VRF stored in pf_vrfs which was collected from
-            # S_VRF[$i] during the deduplication pass.
             local vrf="${pf_vrfs[$k]}"
-
-            # Deduplication key: same target+vrf is only traced once
             local tr_key="${tgt}|${vrf}"
             local already=0
             local td
@@ -2537,11 +2674,9 @@ run_preflight_checks() {
             (( already )) && continue
             tr_done_keys+=("$tr_key")
 
-            # ── Build display label ───────────────────────────────────────
             local vrf_label
             [[ -n "$vrf" ]] && vrf_label="VRF: ${vrf}" || vrf_label="GRT"
 
-            # ── Show command being used ───────────────────────────────────
             local cmd_display
             if [[ "$OS_TYPE" == "linux" && -n "$vrf" ]]; then
                 cmd_display="sudo ip vrf exec ${vrf} traceroute ${tgt}"
@@ -2555,12 +2690,10 @@ run_preflight_checks() {
             bleft "  ${BOLD}$(printf '%-4s  %-40s  %-12s' 'Hop' 'Host / IP' 'RTT')${NC}"
             printf '+%s+\n' "$(rpt '-' "$inner")"
 
-            # ── Run traceroute ────────────────────────────────────────────
             local tr_output
             tr_output=$(_preflight_traceroute_vrf "$tgt" "$vrf")
 
             if [[ "$tr_output" == "UNAVAILABLE" ]]; then
-                # Distinguish between binary not found vs no output
                 local _bin_check
                 _bin_check=$(_find_traceroute_bin)
                 if [[ "$_bin_check" == "UNAVAILABLE" ]]; then
@@ -2574,7 +2707,7 @@ run_preflight_checks() {
                     if [[ "$OS_TYPE" == "linux" && -n "$vrf" ]]; then
                         bleft "  ${DIM}Verify: sudo ip vrf exec ${vrf} ${_found_type} ${tgt}${NC}"
                     fi
-                    bleft "  ${DIM}Possible causes: target on same subnet, ICMP TTL exceeded blocked${NC}"
+                    bleft "  ${DIM}Possible causes: sudo auth failed, target on same subnet, ICMP TTL exceeded blocked${NC}"
                 fi
             else
                 local hop_line hop_count=0
@@ -2586,11 +2719,13 @@ run_preflight_checks() {
                     h_rtt=$(printf '%s'  "$hop_line" | cut -d'|' -f3)
 
                     local h_host_disp="$h_host"
-                    (( ${#h_host_disp} > 40 )) && h_host_disp="${h_host_disp:0:39}~"
+                    (( ${#h_host_disp} > 40 )) && \
+                        h_host_disp="${h_host_disp:0:39}~"
 
                     local h_col="$NC"
                     [[ "$h_host" == "$tgt" ]] && h_col="$GREEN"
-                    [[ "$h_host" == "* * *" || "$h_host" == "*" ]] && h_col="$YELLOW"
+                    [[ "$h_host" == "* * *" || \
+                       "$h_host" == "*" ]] && h_col="$YELLOW"
 
                     bleft "  $(printf '%-4s  ' "$h_num")${h_col}$(printf '%-40s  %-12s' \
                         "$h_host_disp" "$h_rtt")${NC}"
