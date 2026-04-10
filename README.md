@@ -1543,11 +1543,11 @@ sudo ip vrf exec vrf10 traceroute 192.168.114.201
 ```
 
 ``` 
-  **sudo authentication required for VRF traceroute (ip vrf exec vrf10)**
+  sudo authentication required for VRF traceroute (ip vrf exec vrf10)
 
-  **Please enter your sudo password:**
+  Please enter your sudo password:
 
-  **sudo credential cached successfully.**
+  sudo credential cached successfully.
 
   Checking  192.168.114.200:5201  (TCP / VRF:vrf10)...
   Checking  192.168.114.201:5202  (UDP / VRF:vrf10)...
