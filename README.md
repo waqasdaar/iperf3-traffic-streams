@@ -35,6 +35,7 @@ DSCP/QoS marking, TCP tuning, and network impairment injection.*
   - [Use Case 8 — Network Impairment Injection](#use-case-8--network-impairment-injection)
   - [Use Case 9 — Reverse Mode Asymmetric Testing](#use-case-9--reverse-mode-asymmetric-testing)
   - [Use Case 10 — Loopback Local Validation](#use-case-10--loopback-local-validation)
+  - [Use Case 11 - Pre Flight Connectivity Checks](#Pre-Flight-Connectivity-Checks)
 - [Dashboard Reference](#dashboard-reference)
 - [DSCP Reference Table](#dscp-reference-table)
 - [Output and Log Files](#output-and-log-files)
@@ -1202,6 +1203,389 @@ View raw log for stream # (or press Enter/q to quit): 1
   Cleanup complete. All resources released.
 
 ```
+## Use Case 11 - Pre Flight Connectivity Checks
+
+### Pre-Flight Connectivity Checks
+
+#### Overview
+
+The pre-flight connectivity check system in **iperf3 Traffic Streams v8.2**
+automatically verifies the reachability of every configured stream target
+before any iperf3 process is launched. This prevents wasted test windows,
+silent failures, and misleading results caused by basic connectivity
+problems that could have been caught in seconds.
+
+Pre-flight checks run automatically when you confirm stream launch in
+**Client Mode** (menu option 3). They do not run in Server Mode or
+Loopback Mode.
+
+---
+
+### Why Pre-Flight Checks Matter
+
+Without pre-flight checks the following problems are invisible until the
+test is already running:
+
+| Problem | Without Pre-Flight | With Pre-Flight |
+|---|---|---|
+| iperf3 server not started on the remote host | Stream shows FAILED after 10–30 seconds | Caught in < 3 seconds before any iperf3 process starts |
+| Firewall blocking the iperf3 port | Stream launches, hangs, times out | TCP port check identifies the block immediately |
+| Wrong target IP configured | Stream fails with connection refused | ICMP ping fails, operator warned before launch |
+| VRF routing missing for a path | Stream in VRF fails silently | Ping runs inside the VRF context, catches routing gaps |
+| Network path has significant packet loss | Test results are unreliable | WARN shown, operator decides whether to proceed |
+| No route to host | iperf3 exits immediately with error | Pre-flight identifies unreachable target before test |
+| Multiple streams to different targets | Some pass, some fail — hard to correlate | All targets checked and summarised in a single table |
+
+---
+
+### What Gets Checked
+
+For each unique **target + port + protocol + VRF** combination across all
+configured streams, the pre-flight system runs three checks in sequence.
+
+#### Check 1 — ICMP Ping
+
+Sends **3 ICMP echo requests** to the target address.
+
+- On Linux with a VRF configured the ping runs inside the VRF:
+  `ip vrf exec VRF_NAME ping -c 3 -W 2 TARGET`
+- On Linux with GRT (no VRF) the ping runs normally:
+  `ping -c 3 -W 2 TARGET`
+- On macOS the ping runs normally:
+  `ping -c 3 -W 2000 TARGET`
+
+**Results:**
+
+| Result | Condition | Meaning |
+|---|---|---|
+| `PASS` | All 3 replies received (0% loss) | Target is reachable |
+| `WARN` | 1 or 2 replies received (33% or 67% loss) | Intermittent connectivity or ICMP rate-limiting |
+| `FAIL` | No replies (100% loss) | Target is unreachable |
+
+The check also extracts and displays the **min/avg/max RTT** so the
+operator has a baseline latency measurement before the test begins.
+
+---
+
+#### Check 2 — TCP Port Reachability
+
+Attempts to open a TCP connection to `target:port` within a 2-second
+timeout using `/dev/tcp`.
+
+- On Linux with a VRF configured the probe runs inside the VRF using a
+  temporary probe script executed via `ip vrf exec VRF_NAME bash probe.sh`
+- On Linux GRT and macOS the probe runs directly
+
+This check is **skipped for UDP streams** because there is no equivalent
+TCP handshake to verify — UDP connectivity is inferred from the ICMP ping
+result.
+
+**Results:**
+
+| Result | Condition | Meaning |
+|---|---|---|
+| `PASS` | TCP connection opened and closed within 2 seconds | iperf3 server is listening and reachable |
+| `FAIL` | Connection refused or timed out | iperf3 server is not running or port is blocked |
+| `SKIP` | Stream protocol is UDP | TCP check not applicable |
+
+---
+
+#### Check 3 — Traceroute Path Discovery
+
+Runs a traceroute to each unique target (deduplicated by target + VRF)
+to display the hop-by-hop network path.
+
+This check is **informational only** — it does not produce a PASS or FAIL
+verdict. It helps the operator understand the path and identify routing
+anomalies, unexpected transit hops, or high-latency segments.
+
+**Command used:**
+
+| Scenario | Command |
+|---|---|
+| Linux + VRF | `sudo ip vrf exec VRF_NAME traceroute TARGET` |
+| Linux + GRT | `traceroute TARGET` |
+| macOS | `traceroute TARGET` |
+| Loopback (127.x.x.x) | Skipped — no meaningful path |
+
+**Sudo credential handling:**
+
+When a VRF is configured and the operator is not root, `ip vrf exec`
+requires sudo. The pre-flight system calls `sudo -v` interactively
+**before** launching any traceroute subshells so that the credential
+is cached and subsequent sudo calls succeed without prompting mid-output.
+
+---
+
+### VRF Awareness
+
+All three pre-flight checks are **VRF-aware**. When a stream is configured
+with a VRF (either auto-detected from the selected bind interface or entered
+manually), every check runs inside that VRF context.
+
+This is critical because:
+
+- A target may be reachable in GRT but unreachable in a specific VRF
+- The iperf3 stream will use `ip vrf exec VRF_NAME` at runtime — the
+  pre-flight check uses the exact same routing context
+- A firewall rule may allow traffic in GRT but block the same port inside
+  a VRF
+- Route leaking configurations may make a target appear reachable from the
+  wrong VRF
+
+Pre-flight checks that do **not** use the correct VRF would give false
+PASS results and the operator would not discover the routing problem until
+the test is already running.
+
+---
+
+### Deduplication Logic
+
+When multiple streams share the same target, port, protocol, and VRF,
+the pre-flight system checks that combination **only once** but reports
+which stream numbers are affected.
+
+When the same target is accessed via different VRFs (e.g. stream 1 uses
+`vrf10` and stream 2 uses `vrf20` to reach the same IP), each VRF context
+is checked **independently** because they represent different routing paths.
+
+---
+
+### Pre-Flight Results Table
+
+After all checks complete, a consolidated results table is displayed:
+
+```
++==============================================================================+
+| Pre-Flight Results |
++==============================================================================+
+| # Target Port Proto VRF Result RTT min/avg/max Loss TCP Port                 |
++------------------------------------------------------------------------------+
+| 1 192.168.114.200 5201 TCP vrf10 PASS 0.41/0.52/0.71 ms 0% PASS              |
+| 2 10.10.114.1 5202 UDP vrf10 PASS 0.38/0.49/0.63 ms 0% SKIP                  |
+| 3 10.10.114.2 5203 TCP GRT WARN 1.20/4.87/12.3 ms 33% PASS                   |
+| 4 10.10.114.99 5204 TCP vrf10 FAIL N/A 100% FAIL                             |
++==============================================================================+
+
+---
+
+#### Traceroute Path Discovery Output
+
+```
++==============================================================================+
+| Path Discovery — Traceroute                                                  |
++==============================================================================+
+| Target: 192.168.114.200 (VRF: vrf10)                                         |
+| Command: sudo ip vrf exec vrf10 traceroute 192.168.114.200                   |
++------------------------------------------------------------------------------+
+| Hop Host /                        IP RTT                                     |
++------------------------------------------------------------------------------+
+| 1 192.168.110.100                 0.41 ms                                    |
+| 2 10.48.35.24                     1.60 ms                                    |
+| 3 192.168.114.200                 1.58 ms                                    |
++==============================================================================+
+| Target: 10.10.114.1 (GRT)                                                    |
+| Command: traceroute 10.10.114.1                                              |
++------------------------------------------------------------------------------+
+| Hop Host                        / IP RTT                                     |
++------------------------------------------------------------------------------+
+| 1 10.10.114.1                    0.33 ms                                     |
++==============================================================================+
+```
+
+---
+
+#### Failure and Warning Detail Panel
+
+When any check produces a FAIL or WARN result, a diagnostic detail panel
+is shown below the results table explaining what failed and what to check:
+
+```
++==============================================================================+
+| Pre-Flight Failures Detected                                                 |
++==============================================================================+
+| Target 10.10.114.99:5204 (TCP / VRF: vrf10) — stream(s): 4                   |
+| ✗ ICMP Ping FAILED — target unreachable in VRF: vrf10                        |
+| Check: VRF vrf10 routing, target reachable in this VRF                       |
+| ✗ TCP Port 5204 UNREACHABLE in VRF: vrf10                                    |
+| Check: iperf3 server running in VRF vrf10, firewall allows port 5204         |
++------------------------------------------------------------------------------+
++==============================================================================+
+```
+
+For warnings:
+
+```
++==============================================================================+
+| Pre-Flight Warnings Detected                                                 |
++==============================================================================+
+| Target 10.10.114.2:5203 (TCP / GRT) — stream(s): 3                           |
+| ⚠ ICMP Ping PARTIAL — packet loss in GRT                                     |
+| Check: intermittent connectivity or ICMP rate-limiting                       |
++------------------------------------------------------------------------------+
++==============================================================================+
+```
+
+---
+
+#### Operator Decision Prompts
+
+After the checks and diagnostic panels, the operator is asked how to
+proceed based on the severity of the findings.
+
+##### All Checks Pass
+
+All pre-flight checks PASSED. Proceeding to launch streams.
+
+No action required. Streams launch automatically.
+
+---
+
+### Warnings Detected (partial ping loss)
+
+```
+1 target(s) have pre-flight warnings.
+
+Options:
+P Proceed (streams may experience packet loss)
+A Abort
+
+
+Choice [P]:
+
+The default is **P** (proceed) because warnings indicate degraded but
+functional connectivity. The operator may choose to proceed and observe
+the impact on stream results, or abort to investigate before the test.
+
+---
+
+### Failures Detected
+
+```
+2 target(s) FAILED pre-flight checks.
+
+
+Options:
+P Proceed anyway (streams may fail at runtime)
+A Abort (recommended)
+
+
+Choice [A]:
+
+The default is **A** (abort) because failures indicate that one or more
+streams will almost certainly fail at runtime. Proceeding is possible
+but not recommended without resolving the underlying issue.
+
+---
+
+## Use Case Examples
+
+---
+
+### Use Case 1 — Simple Two-Host Test (All Pass)
+
+**Scenario:** Client to server over a direct GRT path. iperf3 server is
+running on `192.168.1.10:5201`.
+
+**Stream configuration:**
+
+| Stream | Target | Port | Protocol | VRF |
+|---|---|---|---|---|
+| 1 | `192.168.1.10` | 5201 | TCP | GRT |
+
+**Pre-flight output:**
+
+Checking 192.168.1.10:5201 (TCP / GRT)...
+
+
++==============================================================================+
+| Pre-Flight Results                                                           |
++==============================================================================+
+| 1 192.168.1.10 5201 TCP GRT PASS 0.28/0.31/0.35 ms 0% PASS                   |
++==============================================================================+
+
+
++==============================================================================+
+| Path Discovery — Traceroute                                                  |
++==============================================================================+
+| Target: 192.168.1.10 (GRT)                                                   |
+| Command: traceroute 192.168.1.10                                             |
++------------------------------------------------------------------------------+
+| Hop Host / IP                       RTT                                      |
++------------------------------------------------------------------------------+
+| 1 192.168.1.1                      0.28 ms                                   |
+| 2 192.168.1.10                     0.31 ms                                   |
++==============================================================================+
+
+
+All pre-flight checks PASSED. Proceeding to launch streams.
+
+**Outcome:** All checks pass. Streams launch immediately without any
+operator interaction.
+
+---
+
+### Use Case 2 — VRF-Specific Path Validation
+
+**Scenario:** Testing traffic inside `vrf10`. The target is
+`192.168.114.200` and the iperf3 server is listening on port `5201`.
+The bind interface `eth1` (IP `10.10.114.3`) belongs to `vrf10`.
+
+**Stream configuration:**
+
+| Stream | Target | Port | Protocol | Bind IP | VRF |
+|--------|--------|------|----------|---------|-----|
+| 1 | `192.168.114.200` | 5201 | TCP | `10.10.114.3` | `vrf10` |
+| 2 | `192.168.114.201` | 5202 | UDP | `10.10.114.3` | `vrf10` |
+
+**Pre-flight commands executed:**
+
+```bash
+# Check 1 — ping inside vrf10
+ip vrf exec vrf10 ping -c 3 -W 2 192.168.114.200
+ip vrf exec vrf10 ping -c 3 -W 2 192.168.114.201
+
+# Check 2 — TCP port inside vrf10 (not applicable to UDP stream 2)
+ip vrf exec vrf10 bash /tmp/iperf3_streams.xxxxx/_preflight_tcp_probe.sh
+
+# Check 3 — traceroute inside vrf10
+sudo ip vrf exec vrf10 traceroute 192.168.114.200
+sudo ip vrf exec vrf10 traceroute 192.168.114.201
+```
+
+`sudo authentication required for VRF traceroute (ip vrf exec vrf10)`
+  **Please enter your sudo password:**
+  **sudo credential cached successfully.**
+
+  Checking  192.168.114.200:5201  (TCP / VRF:vrf10)...
+  Checking  192.168.114.201:5202  (UDP / VRF:vrf10)...
+
++==============================================================================+
+|                            Pre-Flight Results                                |
++==============================================================================+
+|  1    192.168.114.200    5201   TCP    vrf10     PASS    0.41/0.52/0.71 ms   0%      PASS      |
+|  2    192.168.114.201    5202   UDP    vrf10     PASS    0.44/0.55/0.68 ms   0%      SKIP      |
++==============================================================================+
+
++==============================================================================+
+|                         Path Discovery — Traceroute                          |
++==============================================================================+
+|   Target: 192.168.114.200  (VRF: vrf10)                                      |
+|   Command: sudo ip vrf exec vrf10 traceroute 192.168.114.200                 |
++------------------------------------------------------------------------------+
+|   1     192.168.110.100                           0.41 ms                    |
+|   2     10.48.35.24                               1.60 ms                    |
+|   3     192.168.114.200                           1.58 ms                    |
++==============================================================================+
+|   Target: 192.168.114.201  (VRF: vrf10)                                      |
+|   Command: sudo ip vrf exec vrf10 traceroute 192.168.114.201                 |
++------------------------------------------------------------------------------+
+|   1     192.168.110.100                           0.41 ms                    |
+|   2     10.48.35.24                               1.60 ms                    |
+|   3     192.168.114.201                           1.62 ms                    |
++==============================================================================+
+
+  All pre-flight checks PASSED. Proceeding to launch streams.
 
 ## Troubleshooting
 
