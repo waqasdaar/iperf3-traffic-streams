@@ -1583,7 +1583,7 @@ sudo ip vrf exec vrf10 traceroute 192.168.114.201
 **Pre-flight output:**
 
 ```
-sudo authentication required for VRF traceroute (ip vrf exec vrf10)
+  sudo authentication required for VRF traceroute (ip vrf exec vrf10)
   Please enter your sudo password:
   sudo credential cached successfully.
 
