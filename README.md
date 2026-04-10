@@ -1620,6 +1620,62 @@ sudo authentication required for VRF traceroute (ip vrf exec vrf10)
 
   All pre-flight checks PASSED. Proceeding to launch streams.
 ```
+### Use Case 3 — Mixed Multi-Stream with Partial Failures
+
+**Scenario**: Running 4 streams to different targets. Stream 3 has
+intermittent packet loss and stream 4 is completely unreachable.
+
+
+**Stream configuration**:
+
+| **Stream** | **Target**      | **Port** | **Protocol** | **VRF** |
+|------------|-----------------|----------|--------------|---------|
+| 1          | 192.168.114.200 | 5201     | TCP          | vrf10   |
+| 2          | 10.10.114.1     | 5202     | UDP          | vrf10   |
+| 3          | 10.10.114.2     | 5203     | TCP          | GRT     |
+| 4          | 10.10.114.99    | 5204     | UDP          | vrf10   |
+
+````
+Checking  192.168.114.200:5201  (TCP / VRF:vrf10)...
+  Checking  10.10.114.1:5202  (UDP / VRF:vrf10)...
+  Checking  10.10.114.2:5203  (TCP / GRT)...
+  Checking  10.10.114.99:5204  (UDP / VRF:vrf10)...
+
++==============================================================================+
+|                            Pre-Flight Results                                |
++==============================================================================+
+|  1    192.168.114.200    5201   TCP    vrf10     PASS    0.41/0.52/0.71 ms   0%      PASS      |
+|  2    10.10.114.1        5202   UDP    vrf10     PASS    0.38/0.49/0.63 ms   0%      SKIP      |
+|  3    10.10.114.2        5203   TCP    GRT       WARN    1.20/4.87/12.3 ms   33%     PASS      |
+|  4    10.10.114.99       5204   UDP    vrf10     FAIL    N/A                  100%    SKIP      |
++==============================================================================+
+
++==============================================================================+
+|                         Pre-Flight Failures Detected                         |
++==============================================================================+
+|   Target 10.10.114.99:5204 (UDP / VRF: vrf10)  — stream(s): 4               |
+|     ✗ ICMP Ping FAILED — target unreachable in VRF: vrf10                   |
+|       Check: VRF vrf10 routing, target reachable in this VRF                 |
++------------------------------------------------------------------------------+
+|   Target 10.10.114.2:5203 (TCP / GRT)  — stream(s): 3                       |
+|     ⚠ ICMP Ping PARTIAL — packet loss in GRT                                 |
+|       Check: intermittent connectivity or ICMP rate-limiting                 |
++------------------------------------------------------------------------------+
++==============================================================================+
+
+  1 target(s) FAILED pre-flight checks.
+
+  Options:
+    P  Proceed anyway  (streams may fail at runtime)
+    A  Abort           (recommended)
+
+  Choice [A]: P
+
+  Proceeding despite pre-flight failures.
+````
+**Outcome**: Operator chose to proceed. Streams 1 and 2 will run normally.
+Stream 3 may show elevated packet loss in the results. Stream 4 will show
+FAILED in the dashboard with "ICMP Ping FAILED" as the error.
 
 ## Troubleshooting
 
