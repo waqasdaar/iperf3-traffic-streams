@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # =============================================================================
 # iperf3-traffic-streams.sh — Enterprise-grade iperf3 multi-stream traffic manager
-# Version: 8.2.1
-# Author: Waqas Daar(waqasdaar@gmail.com)
+# Version: 8.2.1.1
+# Author : Waqas Daar (waqasdaar@gmail.com)
 # =============================================================================
 
 # =============================================================================
@@ -1450,40 +1450,237 @@ configure_server_streams() {
     local num="$1" dbind="${2:-}" dvrf="${3:-}"
     SRV_PORT=(); SRV_BIND=(); SRV_VRF=(); SRV_ONEOFF=(); SRV_LOGFILE=(); SRV_SCRIPT=()
     local lp=5200 i
+
     for (( i=0; i<num; i++ )); do
         local sn=$(( i + 1 ))
         echo ""; bline '='; bcenter "${BOLD}Server Listener ${sn} of ${num}${NC}"; bline '='; echo ""
+
+        # ── Port ─────────────────────────────────────────────────────────────
         local dp=$(( lp + 1 )) port
         while true; do
-            read -r -p "  Listen port [$dp]: " port </dev/tty; port="${port:-$dp}"
+            read -r -p "  Listen port [$dp]: " port </dev/tty
+            port="${port:-$dp}"
             if validate_port "$port"; then
                 port=$(( 10#$port ))
                 (( port < 1024 && IS_ROOT == 0 )) && \
                     printf '%b\n' "${YELLOW}  WARNING: port $port < 1024 requires root.${NC}"
                 break
-            fi; printf '%b\n' "${RED}  Invalid port. Enter 1-65535.${NC}"
-        done; lp="$port"; SRV_PORT+=("$port")
-        local bip
-        if [[ -n "$dbind" && "$dbind" != "N/A" ]]; then
-            read -r -p "  Bind IP [$dbind]: " bip </dev/tty; bip="${bip:-$dbind}"
-        else
-            read -r -p "  Bind IP (press Enter for 0.0.0.0): " bip </dev/tty; bip="${bip:-}"
-        fi; SRV_BIND+=("$bip")
+            fi
+            printf '%b\n' "${RED}  Invalid port. Enter 1-65535.${NC}"
+        done
+        lp="$port"; SRV_PORT+=("$port")
+
+        # ── Bind IP ───────────────────────────────────────────────────────────
+        # The operator can:
+        #   Enter    → bind to 0.0.0.0 (all interfaces)
+        #   0        → bind to 0.0.0.0 (all interfaces, explicit)
+        #   list     → print the interface table, then re-prompt
+        #   1..N     → select interface #N from the table
+        #   x.x.x.x  → enter a specific IP directly
+        #
+        # When an interface is selected by number, the VRF membership of
+        # that interface is auto-detected and used as the default VRF.
+
+        local bip=""
+        local auto_vrf=""
+        local bind_from_grt=0
+        local _srv_bind_table_shown=0
+
+        echo ""
+        printf '%b\n' "${CYAN}  -- Bind IP Address --${NC}"
+        printf '%b\n' \
+            "  Enter an IP, interface ${BOLD}#${NC} from table, '${BOLD}list${NC}' to show table, or ${BOLD}Enter${NC} for 0.0.0.0."
+        echo ""
+
+        # Show the interface table automatically the first time
+        get_interface_list
+        show_interface_table
+        echo ""
+        _srv_bind_table_shown=1
+
+        while true; do
+            local _srv_bind_raw
+            read -r -p "  Bind IP (Enter=0.0.0.0, #=interface, IP, 'list'): " \
+                _srv_bind_raw </dev/tty
+            _srv_bind_raw="${_srv_bind_raw:-}"
+
+            # ── Empty input → bind all interfaces ────────────────────────────
+            if [[ -z "$_srv_bind_raw" ]]; then
+                bip=""
+                auto_vrf=""
+                bind_from_grt=0
+                printf '%b\n' "${CYAN}  Listener will bind to 0.0.0.0 (all interfaces).${NC}"
+                break
+            fi
+
+            # ── 'list' keyword → refresh and reprint table ────────────────────
+            local _srv_bind_lower
+            _srv_bind_lower=$(printf '%s' "$_srv_bind_raw" | tr '[:upper:]' '[:lower:]')
+            if [[ "$_srv_bind_lower" == "list" ]]; then
+                echo ""
+                get_interface_list
+                show_interface_table
+                echo ""
+                _srv_bind_table_shown=1
+                continue
+            fi
+
+            # ── Numeric input → select interface by table row number ──────────
+            if [[ "$_srv_bind_raw" =~ ^[0-9]+$ ]]; then
+                local _srv_sel_num=$(( 10#$_srv_bind_raw ))
+                local _srv_total_ifaces=${#IFACE_NAMES[@]}
+
+                # 0 = explicit all-interfaces bind
+                if (( _srv_sel_num == 0 )); then
+                    bip=""
+                    auto_vrf=""
+                    bind_from_grt=0
+                    printf '%b\n' "${CYAN}  Listener will bind to 0.0.0.0 (all interfaces).${NC}"
+                    break
+                fi
+
+                if (( _srv_sel_num >= 1 && _srv_sel_num <= _srv_total_ifaces )); then
+                    local _srv_sel_idx=$(( _srv_sel_num - 1 ))
+                    local _srv_sel_ip="${IFACE_IPS[$_srv_sel_idx]}"
+                    local _srv_sel_iface="${IFACE_NAMES[$_srv_sel_idx]}"
+                    local _srv_sel_state="${IFACE_STATES[$_srv_sel_idx]}"
+                    local _srv_sel_vrf="${IFACE_VRFS[$_srv_sel_idx]}"
+
+                    # Reject interfaces with no IPv4 address
+                    if [[ "$_srv_sel_ip" == "N/A" || -z "$_srv_sel_ip" ]]; then
+                        printf '%b\n' \
+                            "${RED}  ${_srv_sel_iface} has no IPv4 address. Choose another or enter an IP directly.${NC}"
+                        continue
+                    fi
+
+                    # Warn but allow non-up interfaces
+                    if [[ "$_srv_sel_state" != "up" ]]; then
+                        printf '%b\n' \
+                            "${YELLOW}  WARNING: ${_srv_sel_iface} state='${_srv_sel_state}'.${NC}"
+                    fi
+
+                    printf '%b  Bind IP: %s → %s%b\n' \
+                        "$GREEN" "$_srv_sel_iface" "$_srv_sel_ip" "$NC"
+                    bip="$_srv_sel_ip"
+
+                    # ── Auto-detect VRF from selected interface ────────────────
+                    if [[ "$OS_TYPE" == "linux" ]]; then
+                        if [[ "$_srv_sel_vrf" == "GRT" || -z "$_srv_sel_vrf" ]]; then
+                            auto_vrf=""
+                            bind_from_grt=1
+                            printf '%b  Interface is in GRT — VRF will not be used for this listener.%b\n' \
+                                "$CYAN" "$NC"
+                        else
+                            auto_vrf="$_srv_sel_vrf"
+                            bind_from_grt=0
+                            printf '%b  Auto-detected VRF from interface: %s%b\n' \
+                                "$GREEN" "$auto_vrf" "$NC"
+                        fi
+                    fi
+                    break
+
+                else
+                    printf '%b\n' \
+                        "${RED}  Invalid number. Enter 0 or 1-${_srv_total_ifaces}.${NC}"
+                    continue
+                fi
+            fi
+
+            # ── Direct IP address entry ───────────────────────────────────────
+            if validate_ip "$_srv_bind_raw"; then
+                printf '%b  Bind IP set to: %s%b\n' "$GREEN" "$_srv_bind_raw" "$NC"
+                bip="$_srv_bind_raw"
+                auto_vrf=""
+                bind_from_grt=0
+                break
+            fi
+
+            # ── Unrecognised input ────────────────────────────────────────────
+            printf '%b\n' "${RED}  Unrecognised input '${_srv_bind_raw}'.${NC}"
+            printf '%b\n' \
+                "${RED}  Enter: IP address | interface number | 'list' | Enter for 0.0.0.0${NC}"
+        done
+        SRV_BIND+=("$bip")
+
+        # ── VRF (Linux only) ──────────────────────────────────────────────────
+        #
+        # Decision matrix — same as client mode:
+        #
+        #   bind_from_grt == 1   → GRT interface selected, skip VRF prompt,
+        #                          force vval="" so no ip vrf exec is applied.
+        #
+        #   auto_vrf non-empty   → VRF auto-detected from interface selection.
+        #                          Present as default, operator can override.
+        #
+        #   bip empty (0.0.0.0)  → No specific interface, allow optional VRF.
+        #
+        #   bip non-empty +
+        #   no auto_vrf          → Raw IP entered. Prompt for optional VRF.
+        #
         local vval=""
         if [[ "$OS_TYPE" == "linux" ]]; then
-            if [[ -n "$dvrf" ]]; then
-                read -r -p "  VRF [$dvrf]: " vval </dev/tty; vval="${vval:-$dvrf}"
+
+            if (( bind_from_grt == 1 )); then
+                # GRT interface — skip VRF prompt entirely
+                vval=""
+                printf '%b  Listener will use GRT (no VRF exec applied).%b\n' \
+                    "$CYAN" "$NC"
+
+            elif [[ -n "$auto_vrf" ]]; then
+                # VRF auto-detected from selected interface
+                printf '%b\n' \
+                    "  ${GREEN}Auto-detected VRF: ${BOLD}${auto_vrf}${NC}${GREEN} (from selected interface)${NC}"
+                read -r -p "  VRF [${auto_vrf}]: " vval </dev/tty
+                vval="${vval:-$auto_vrf}"
+
+                if [[ -z "$vval" ]]; then
+                    printf '%b  VRF cleared — listener will use GRT.%b\n' \
+                        "$YELLOW" "$NC"
+                else
+                    if (( IS_ROOT == 0 )); then
+                        printf '%b\n' \
+                            "${YELLOW}  WARNING: ip vrf exec requires root.${NC}"
+                    fi
+                    printf '%b  Listener will use VRF: %s%b\n' "$CYAN" "$vval" "$NC"
+                fi
+
+            elif [[ -n "$dvrf" ]]; then
+                # Session-level VRF default
+                read -r -p "  VRF [$dvrf]: " vval </dev/tty
+                vval="${vval:-$dvrf}"
+                if [[ -n "$vval" ]]; then
+                    (( IS_ROOT == 0 )) && \
+                        printf '%b\n' "${YELLOW}  WARNING: ip vrf exec requires root.${NC}"
+                    printf '%b  Listener will use VRF: %s%b\n' "$CYAN" "$vval" "$NC"
+                else
+                    printf '%b  Listener will use GRT (no VRF).%b\n' "$CYAN" "$NC"
+                fi
+
             else
-                read -r -p "  VRF (press Enter for GRT/none): " vval </dev/tty; vval="${vval:-}"
+                # No auto-detection — prompt for optional VRF
+                read -r -p "  VRF (press Enter for GRT/none): " vval </dev/tty
+                vval="${vval:-}"
+                if [[ -n "$vval" ]]; then
+                    (( IS_ROOT == 0 )) && \
+                        printf '%b\n' "${YELLOW}  WARNING: ip vrf exec requires root.${NC}"
+                    printf '%b  Listener will use VRF: %s%b\n' "$CYAN" "$vval" "$NC"
+                else
+                    printf '%b  Listener will use GRT (no VRF).%b\n' "$CYAN" "$NC"
+                fi
             fi
-            [[ -n "$vval" && $IS_ROOT -eq 0 ]] && \
-                printf '%b\n' "${YELLOW}  WARNING: ip vrf exec requires root.${NC}"
         fi
         SRV_VRF+=("$vval")
-        local oi; read -r -p "  One-off mode -1 (exit after one client)? [no]: " oi </dev/tty
+
+        # ── One-off mode ──────────────────────────────────────────────────────
+        local oi
+        read -r -p "  One-off mode -1 (exit after one client)? [no]: " oi </dev/tty
         local oo=0; [[ "$oi" =~ ^[Yy] ]] && oo=1
-        SRV_ONEOFF+=("$oo"); SRV_LOGFILE+=(""); SRV_SCRIPT+=("")
-    done; SERVER_COUNT="$num"
+        SRV_ONEOFF+=("$oo")
+        SRV_LOGFILE+=("")
+        SRV_SCRIPT+=("")
+    done
+
+    SERVER_COUNT="$num"
 }
 
 show_stream_summary() {
@@ -2707,6 +2904,594 @@ _pmtu_annotate_stream_summary() {
 }
 
 # =============================================================================
+# SECTION 10d — DSCP MARKING VERIFICATION
+# =============================================================================
+#
+# Captures a brief tcpdump sample on the egress interface for a selected
+# stream and parses the IP TOS field from captured packets to verify that
+# the DSCP value in live traffic matches what was configured.
+#
+# Design:
+#   - Triggered interactively by the operator pressing v/V or p/P during
+#     the live client dashboard
+#   - When multiple streams are running the operator selects which stream
+#     to verify
+#   - tcpdump runs for a short capture window (default 3 seconds, 50 packets)
+#     on the correct egress interface for the stream's target
+#   - VRF-aware: when the stream uses a VRF the interface is resolved inside
+#     that VRF's routing table
+#   - Output shows per-packet details: src IP, dst IP, src port, dst port,
+#     TOS hex, DSCP decimal, and a PASS/FAIL verdict
+#   - Results are displayed in a formatted box below the dashboard and
+#     cleared when the operator dismisses them
+#
+# Requirements:
+#   tcpdump     — packet capture
+#   root/sudo   — tcpdump requires CAP_NET_RAW or root
+#   Linux only  — not supported on macOS in VRF context (no ip vrf exec)
+#                 macOS supported in GRT mode if tcpdump is available
+#
+# Failure scenarios handled:
+#   - tcpdump not installed → clear error message
+#   - insufficient privileges → sudo prompt or error
+#   - interface not resolvable → error with guidance
+#   - stream has no DSCP configured → PASS treated as DSCP=0
+#   - no packets captured → warning, possible causes listed
+#   - UDP stream with no active traffic → advisory shown
+#   - stream not in CONNECTED state → warning
+#   - loopback interface → special handling (src=dst interface)
+# =============================================================================
+
+# ---------------------------------------------------------------------------
+# _dscp_verify_get_iface  <stream_index>
+#
+# Returns the correct capture interface for a stream based on:
+#   Priority 1: S_BIND[$idx] — if a source IP is bound, find the interface
+#               that owns that IP address. This is the actual egress interface
+#               regardless of VRF membership.
+#   Priority 2: Route lookup for S_TARGET[$idx] inside the stream's VRF
+#               or GRT when no VRF is configured.
+#   Special:    Loopback targets (127.x.x.x) always return "lo".
+#
+# Prints the interface name or empty string on failure.
+# ---------------------------------------------------------------------------
+
+_dscp_verify_get_iface() {
+    local idx="$1"
+    local target="${S_TARGET[$idx]:-}"
+    local vrf="${S_VRF[$idx]:-}"
+    local bind_ip="${S_BIND[$idx]:-}"
+
+    # ── Special case: loopback target ─────────────────────────────────────
+    if [[ "$target" =~ ^127\. || "$target" == "::1" ]]; then
+        printf '%s' "lo"
+        return 0
+    fi
+
+    # ── Priority 1: resolve interface from bind IP ────────────────────────
+    # When S_BIND is set, iperf3 sends packets from that specific IP.
+    # Find the interface that owns that IP — this is the actual capture iface.
+    if [[ -n "$bind_ip" && "$bind_ip" != "0.0.0.0" ]]; then
+        local bind_iface=""
+
+        if [[ "$OS_TYPE" == "linux" ]]; then
+            # Search all interfaces for the bind IP
+            bind_iface=$(ip -4 addr show 2>/dev/null \
+                | awk -v ip="$bind_ip" '
+                    /^[0-9]+:/ { iface = $2; gsub(/:$/, "", iface) }
+                    /inet / {
+                        split($2, a, "/")
+                        if (a[1] == ip) { print iface; exit }
+                    }')
+
+            # If VRF is set, also try searching within the VRF context
+            if [[ -z "$bind_iface" && -n "$vrf" ]]; then
+                bind_iface=$(ip vrf exec "${vrf}" ip -4 addr show 2>/dev/null \
+                    | awk -v ip="$bind_ip" '
+                        /^[0-9]+:/ { iface = $2; gsub(/:$/, "", iface) }
+                        /inet / {
+                            split($2, a, "/")
+                            if (a[1] == ip) { print iface; exit }
+                        }')
+            fi
+        elif [[ "$OS_TYPE" == "macos" ]]; then
+            bind_iface=$(ifconfig 2>/dev/null \
+                | awk -v ip="$bind_ip" '
+                    /^[a-z]/ { iface = $1; gsub(/:$/, "", iface) }
+                    /inet / {
+                        if ($2 == ip) { print iface; exit }
+                    }')
+        fi
+
+        if [[ -n "$bind_iface" ]]; then
+            printf '%s' "$bind_iface"
+            return 0
+        fi
+
+        # bind_ip set but interface not found — fall through to route lookup
+        # and warn in the caller
+    fi
+
+    # ── Priority 2: route lookup for target ───────────────────────────────
+    if [[ "$OS_TYPE" == "linux" ]]; then
+        local oif=""
+        if [[ -n "$vrf" ]]; then
+            oif=$(ip vrf exec "${vrf}" ip route get "${target}" \
+                2>/dev/null | grep -oE '\bdev [^ ]+' | awk '{print $2}' | head -1)
+        else
+            oif=$(ip route get "${target}" \
+                2>/dev/null | grep -oE '\bdev [^ ]+' | awk '{print $2}' | head -1)
+        fi
+        printf '%s' "${oif:-}"
+    elif [[ "$OS_TYPE" == "macos" ]]; then
+        local oif=""
+        oif=$(route -n get "${target}" 2>/dev/null \
+            | grep -E 'interface:' | awk '{print $2}' | head -1)
+        printf '%s' "${oif:-}"
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# _dscp_verify_check_tcpdump
+#
+# Checks whether tcpdump is available and we have permission to use it.
+# Returns 0 if available, 1 if not.
+# Prints a descriptive error to stdout on failure (caller displays it).
+# ---------------------------------------------------------------------------
+_dscp_verify_check_tcpdump() {
+    # Check binary exists
+    local tcpdump_bin=""
+    if command -v tcpdump >/dev/null 2>&1; then
+        tcpdump_bin=$(command -v tcpdump)
+    elif [[ -x "/usr/sbin/tcpdump" ]]; then
+        tcpdump_bin="/usr/sbin/tcpdump"
+    elif [[ -x "/usr/bin/tcpdump" ]]; then
+        tcpdump_bin="/usr/bin/tcpdump"
+    fi
+
+    if [[ -z "$tcpdump_bin" ]]; then
+        printf '%s' "NOTFOUND"
+        return 1
+    fi
+
+    # Check permission (root or sudo)
+    if (( IS_ROOT == 0 )); then
+        if ! sudo -n true 2>/dev/null; then
+            printf '%s' "NOPERM"
+            return 1
+        fi
+    fi
+
+    printf '%s' "$tcpdump_bin"
+    return 0
+}
+
+# ---------------------------------------------------------------------------
+# _dscp_verify_run  <stream_index>
+#
+# Runs tcpdump on the correct interface for the stream, parses TOS/DSCP
+# values from captured packets, and displays a verification table.
+# ---------------------------------------------------------------------------
+_dscp_verify_run() {
+    local idx="$1"
+    local inner=$(( COLS - 2 ))
+
+    local target="${S_TARGET[$idx]:-}"
+    local port="${S_PORT[$idx]:-}"
+    local proto="${S_PROTO[$idx]:-TCP}"
+    local vrf="${S_VRF[$idx]:-}"
+    local bind_ip="${S_BIND[$idx]:-}"
+    local configured_dscp="${S_DSCP_VAL[$idx]:--1}"
+    local configured_dscp_name="${S_DSCP_NAME[$idx]:-}"
+    local stream_num=$(( idx + 1 ))
+
+    # Normalise unconfigured DSCP to 0 (Best Effort)
+    if [[ "$configured_dscp" == "-1" || -z "$configured_dscp" ]]; then
+        configured_dscp=0
+        configured_dscp_name="CS0/BE"
+    fi
+    [[ -z "$configured_dscp_name" ]] && configured_dscp_name="CS0/BE"
+
+    # ── Display header ────────────────────────────────────────────────────
+    printf '\n'
+    printf '+%s+\n' "$(rpt '=' "$inner")"
+    bcenter "${BOLD}${CYAN}DSCP Marking Verification — Stream ${stream_num}${NC}"
+    printf '+%s+\n' "$(rpt '=' "$inner")"
+
+    local vrf_label
+    [[ -n "$vrf" ]] && vrf_label="VRF: ${vrf}" || vrf_label="GRT"
+
+    bleft "  Target   : ${BOLD}${target}:${port}${NC}  (${proto} / ${vrf_label})"
+    [[ -n "$bind_ip" ]] && bleft "  Bind IP  : ${BOLD}${bind_ip}${NC}"
+    bleft "  DSCP cfg : ${BOLD}${configured_dscp_name}${NC}  (value: ${configured_dscp},  TOS: $(( configured_dscp * 4 )))"
+    printf '+%s+\n' "$(rpt '-' "$inner")"
+
+    # ── Check tcpdump ─────────────────────────────────────────────────────
+    local tcpdump_result
+    tcpdump_result=$(_dscp_verify_check_tcpdump)
+    local tcpdump_rc=$?
+
+    if (( tcpdump_rc != 0 )); then
+        case "$tcpdump_result" in
+            NOTFOUND)
+                bleft "  ${RED}✗ tcpdump not found.${NC}"
+                bleft "  ${DIM}Install: apt install tcpdump  |  yum install tcpdump${NC}"
+                ;;
+            NOPERM)
+                bleft "  ${RED}✗ Insufficient privileges for tcpdump.${NC}"
+                bleft "  ${DIM}Run as root or grant sudo access for tcpdump.${NC}"
+                ;;
+        esac
+        printf '+%s+\n' "$(rpt '=' "$inner")"
+        return 1
+    fi
+
+    local tcpdump_bin="$tcpdump_result"
+
+    # ── Check stream status ───────────────────────────────────────────────
+    local stream_status="${S_STATUS_CACHE[$idx]:-STARTING}"
+    if [[ "$stream_status" != "CONNECTED" && "$stream_status" != "DONE" ]]; then
+        bleft "  ${YELLOW}⚠ Stream ${stream_num} is not CONNECTED (current: ${stream_status}).${NC}"
+        bleft "  ${DIM}Traffic may not be flowing — capture may return no results.${NC}"
+        printf '+%s+\n' "$(rpt '-' "$inner")"
+    fi
+
+    # ── Resolve interface ─────────────────────────────────────────────────
+    local iface
+    iface=$(_dscp_verify_get_iface "$idx")
+
+    if [[ -z "$iface" ]]; then
+        bleft "  ${RED}✗ Cannot resolve egress interface.${NC}"
+        if [[ -n "$bind_ip" ]]; then
+            bleft "  ${DIM}Bind IP ${bind_ip} was not found on any local interface.${NC}"
+        fi
+        bleft "  ${DIM}Check routing: ip route get ${target}${NC}"
+        [[ -n "$vrf" ]] && \
+            bleft "  ${DIM}In VRF: ip vrf exec ${vrf} ip route get ${target}${NC}"
+        printf '+%s+\n' "$(rpt '=' "$inner")"
+        return 1
+    fi
+
+    bleft "  Interface: ${BOLD}${iface}${NC}"
+
+    # ── Determine interface resolution method for display ─────────────────
+    if [[ -n "$bind_ip" && "$bind_ip" != "0.0.0.0" ]]; then
+        bleft "  ${DIM}Interface resolved from bind IP ${bind_ip}${NC}"
+    elif [[ -n "$vrf" ]]; then
+        bleft "  ${DIM}Interface resolved via VRF ${vrf} route to ${target}${NC}"
+    else
+        bleft "  ${DIM}Interface resolved via GRT route to ${target}${NC}"
+    fi
+
+    bleft "  ${DIM}Capturing up to 50 packets (3 second window)...${NC}"
+    printf '+%s+\n' "$(rpt '-' "$inner")"
+
+    # ── Build tcpdump filter ───────────────────────────────────────────────
+    local proto_lower
+    proto_lower=$(printf '%s' "$proto" | tr '[:upper:]' '[:lower:]')
+
+    local tcpdump_filter
+    if [[ "$iface" == "lo" || "$iface" == "lo0" ]]; then
+        # Loopback: capture both directions
+        tcpdump_filter="${proto_lower} and host ${target} and port ${port}"
+    else
+        # Physical interface: capture outbound to target
+        tcpdump_filter="${proto_lower} and dst host ${target} and dst port ${port}"
+    fi
+
+    # ── Run tcpdump ───────────────────────────────────────────────────────
+    # Use -v for TOS field, -n for no DNS, -l for line-buffered output.
+    # Run for 3 seconds or 50 packets, whichever comes first.
+    local capture_file="${TMPDIR}/dscp_cap_${idx}_$$.txt"
+
+    local capture_cmd
+    if (( IS_ROOT == 1 )); then
+        capture_cmd="${tcpdump_bin} -i ${iface} -v -n -l -c 50 ${tcpdump_filter}"
+    else
+        capture_cmd="sudo ${tcpdump_bin} -i ${iface} -v -n -l -c 50 ${tcpdump_filter}"
+    fi
+
+    # Capture stdout and stderr together so we see tcpdump error messages
+    timeout 3 bash -c "${capture_cmd}" > "$capture_file" 2>&1
+    # timeout rc 124 = time limit reached (normal for our 3s window)
+
+    if [[ ! -f "$capture_file" || ! -s "$capture_file" ]]; then
+        bleft "  ${YELLOW}⚠ No output from tcpdump.${NC}"
+        bleft "  ${DIM}Ensure traffic is actively flowing and retry.${NC}"
+        printf '+%s+\n' "$(rpt '=' "$inner")"
+        rm -f "$capture_file"
+        return 1
+    fi
+
+    # Check if tcpdump reported an error (permission denied, interface not found)
+    if grep -qiE 'permission denied|Operation not permitted|No such device|SIOCETHTOOL' \
+            "$capture_file" 2>/dev/null; then
+        bleft "  ${RED}✗ tcpdump error:${NC}"
+        local err_line
+        err_line=$(grep -iE 'permission denied|Operation not permitted|No such device' \
+            "$capture_file" 2>/dev/null | head -1)
+        bleft "  ${DIM}${err_line}${NC}"
+        printf '+%s+\n' "$(rpt '=' "$inner")"
+        rm -f "$capture_file"
+        return 1
+    fi
+
+    # ── Parse captured packets ────────────────────────────────────────────
+    #
+    # tcpdump -v produces output in this general form per packet:
+    #
+    # HH:MM:SS.ffffff IP (tos 0xb8, ttl 64, id 1234, ...) \
+    #     SRC_IP.SRC_PORT > DST_IP.DST_PORT: FLAGS
+    #
+    # The timestamp + "IP (tos ...)" part may be on line 1.
+    # The "SRC > DST:" part may be on the same line or the next.
+    #
+    # Strategy:
+    #   1. Pre-process the file: join continuation lines (lines starting
+    #      with whitespace) onto the preceding line.
+    #   2. For each merged line: extract TOS hex, src IP:port, dst IP:port.
+    #
+    # This handles all known tcpdump -v output formats.
+
+    # Step 1: merge continuation lines
+    local merged_file="${TMPDIR}/dscp_merged_${idx}_$$.txt"
+    awk '
+        /^[[:space:]]/ && NR > 1 {
+            # continuation line — append to previous
+            printf " %s", $0
+            next
+        }
+        NR > 1 { print "" }
+        { printf "%s", $0 }
+        END { print "" }
+    ' "$capture_file" > "$merged_file"
+
+    # Step 2: parse merged lines
+    bleft "  ${BOLD}$(printf '%-4s  %-21s  %-21s  %-6s  %-4s  %-4s  %-6s' \
+        'Pkt' 'Source IP:Port' 'Destination IP:Port' 'TOS' 'Got' 'Exp' 'Result')${NC}"
+    printf '+%s+\n' "$(rpt '-' "$inner")"
+
+    local pass_count=0
+    local fail_count=0
+    local pkt_num=0
+
+    while IFS= read -r merged_line; do
+        # Must contain "tos" and ">" to be a packet data line
+        echo "$merged_line" | grep -qiE 'tos 0x' || continue
+        echo "$merged_line" | grep -qE '>' || continue
+
+        # ── Extract TOS hex ───────────────────────────────────────────────
+        local tos_hex
+        tos_hex=$(printf '%s' "$merged_line" \
+            | grep -oE 'tos 0x[0-9a-fA-F]+' \
+            | awk '{print $2}' | head -1)
+        [[ -z "$tos_hex" ]] && continue
+
+        # ── Extract src and dst addresses ─────────────────────────────────
+        # Pattern: w.x.y.z.PORT > a.b.c.d.PORT  (dot-separated port)
+        # or:      w.x.y.z:PORT > a.b.c.d:PORT  (colon-separated port)
+        local addr_match
+        addr_match=$(printf '%s' "$merged_line" | grep -oE \
+            '[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}[.:][0-9]+ +> +[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}[.:][0-9]+' \
+            | head -1)
+        [[ -z "$addr_match" ]] && continue
+
+        # Parse src and dst from the match
+        local src_raw dst_raw
+        src_raw=$(printf '%s' "$addr_match" | awk '{print $1}')
+        dst_raw=$(printf '%s' "$addr_match" | awk '{print $3}')
+
+        # Convert dot-notation port to colon-notation for display
+        # "192.168.1.1.54321" → "192.168.1.1:54321"
+        # "192.168.1.1:54321" → unchanged
+        local src_display dst_display
+        src_display=$(printf '%s' "$src_raw" | awk -F'.' '{
+            if (NF == 5) {
+                printf "%s.%s.%s.%s:%s", $1, $2, $3, $4, $5
+            } else {
+                print $0
+            }
+        }')
+        dst_display=$(printf '%s' "$dst_raw" | awk -F'.' '{
+            if (NF == 5) {
+                printf "%s.%s.%s.%s:%s", $1, $2, $3, $4, $5
+            } else {
+                print $0
+            }
+        }')
+
+        # ── Calculate DSCP ────────────────────────────────────────────────
+        local tos_dec
+        tos_dec=$(( 16#${tos_hex#0x} ))
+        local captured_dscp=$(( tos_dec >> 2 ))
+
+        # ── Verdict ───────────────────────────────────────────────────────
+        local verdict_col
+        if (( captured_dscp == configured_dscp )); then
+            verdict_col="${GREEN}${BOLD}PASS${NC}"
+            (( pass_count++ ))
+        else
+            verdict_col="${RED}${BOLD}FAIL${NC}"
+            (( fail_count++ ))
+        fi
+
+        (( pkt_num++ ))
+
+        # Display up to 20 rows
+        if (( pkt_num <= 20 )); then
+            local src_disp="$src_display"
+            local dst_disp="$dst_display"
+            (( ${#src_disp} > 21 )) && src_disp="${src_disp:0:20}~"
+            (( ${#dst_disp} > 21 )) && dst_disp="${dst_disp:0:20}~"
+
+            local pfx
+            pfx=$(printf '%-4d  %-21s  %-21s  %-6s  %-4d  %-4d  ' \
+                "$pkt_num" "$src_disp" "$dst_disp" \
+                "$tos_hex" "$captured_dscp" "$configured_dscp")
+            bleft " ${pfx}${verdict_col}"
+        fi
+
+    done < "$merged_file"
+
+    rm -f "$capture_file" "$merged_file"
+
+    # ── Summary ───────────────────────────────────────────────────────────
+    printf '+%s+\n' "$(rpt '-' "$inner")"
+
+    local total_pkts=$(( pass_count + fail_count ))
+
+    if (( total_pkts == 0 )); then
+        bleft "  ${YELLOW}⚠ Packets captured but TOS/address data could not be parsed.${NC}"
+        bleft "  ${DIM}This usually means traffic was not flowing during the capture window.${NC}"
+        bleft "  ${DIM}Try again while the stream is actively sending data.${NC}"
+    else
+        if (( pkt_num > 20 )); then
+            bleft "  ${DIM}(Showing first 20 of ${total_pkts} packets analysed)${NC}"
+        fi
+
+        local overall_col overall_label
+        if (( fail_count == 0 )); then
+            overall_col="$GREEN"
+            overall_label="PASS"
+        else
+            overall_col="$RED"
+            overall_label="FAIL"
+        fi
+
+        bleft "  ${BOLD}Summary:${NC}  ${total_pkts} packets  |  ${GREEN}${pass_count} PASS${NC}  |  ${RED}${fail_count} FAIL${NC}"
+        bleft "  ${BOLD}Verdict:${NC}  ${overall_col}${BOLD}${overall_label}${NC}  — DSCP marking$(
+            (( fail_count == 0 )) \
+                && printf ' verified correct' \
+                || printf ' MISMATCH detected'
+        ) on stream ${stream_num}"
+
+        if (( fail_count > 0 )); then
+            bleft "  ${RED}  Expected DSCP ${configured_dscp} (TOS 0x$(
+                printf '%02x' $(( configured_dscp * 4 ))
+            )) — captured DSCP values differ${NC}"
+            bleft "  ${DIM}  Possible causes:${NC}"
+            bleft "  ${DIM}    - QoS policy rewriting DSCP on egress${NC}"
+            bleft "  ${DIM}    - iptables/nftables DSCP remarking rules${NC}"
+            bleft "  ${DIM}    - NIC hardware offload overwriting TOS${NC}"
+            bleft "  ${DIM}    - DSCP not applied (iperf3 -S flag missing or ignored)${NC}"
+        fi
+    fi
+
+    printf '+%s+\n' "$(rpt '=' "$inner")"
+    return 0
+}
+
+# ---------------------------------------------------------------------------
+# _dscp_verify_interactive
+#
+# Called from the dashboard input handler when the operator presses v/V or p/P.
+# Temporarily suspends the dashboard, runs DSCP verification for a selected
+# stream, displays results, then resumes the dashboard.
+#
+# Must be called OUTSIDE the dashboard render loop (from the input poller).
+# ---------------------------------------------------------------------------
+
+_dscp_verify_interactive() {
+    local inner=$(( COLS - 2 ))
+
+    printf '\033[?25h'
+    printf '\n'
+
+    # Check tcpdump availability early
+    local tcpdump_check
+    tcpdump_check=$(_dscp_verify_check_tcpdump)
+    local tc_rc=$?
+
+    if (( tc_rc != 0 )); then
+        printf '\n'
+        printf '+%s+\n' "$(rpt '=' "$inner")"
+        bcenter "${BOLD}${CYAN}DSCP Marking Verification${NC}"
+        printf '+%s+\n' "$(rpt '=' "$inner")"
+        case "$tcpdump_check" in
+            NOTFOUND)
+                bleft "  ${RED}✗ tcpdump is not installed on this system.${NC}"
+                bleft "  ${DIM}Install: apt install tcpdump  |  yum install tcpdump${NC}"
+                ;;
+            NOPERM)
+                bleft "  ${YELLOW}⚠ tcpdump requires elevated privileges.${NC}"
+                bleft "  ${DIM}Re-run the script as root, or cache sudo credentials first.${NC}"
+                bleft "  ${DIM}Run: sudo -v   then retry the verification.${NC}"
+                ;;
+        esac
+        printf '+%s+\n' "$(rpt '=' "$inner")"
+        printf '\n'
+        read -r -p "  Press Enter to return to dashboard..." </dev/tty
+        printf '\033[?25l'
+        return 1
+    fi
+
+    # Select stream
+    local selected_idx=-1
+
+    if (( STREAM_COUNT == 1 )); then
+        selected_idx=0
+    else
+        printf '\n'
+        printf '+%s+\n' "$(rpt '=' "$inner")"
+        bcenter "${BOLD}${CYAN}DSCP Marking Verification — Select Stream${NC}"
+        printf '+%s+\n' "$(rpt '=' "$inner")"
+        bleft "  ${BOLD}$(printf '%-3s  %-5s  %-16s  %-6s  %-8s  %-10s' \
+            '#' 'Proto' 'Target' 'Port' 'DSCP' 'Status')${NC}"
+        printf '+%s+\n' "$(rpt '-' "$inner")"
+
+        local i
+        for (( i=0; i<STREAM_COUNT; i++ )); do
+            local sn=$(( i + 1 ))
+            local st="${S_STATUS_CACHE[$i]:-STARTING}"
+            local tgt="${S_TARGET[$i]:-?}"
+            (( ${#tgt} > 16 )) && tgt="${tgt:0:15}~"
+            local dscp_disp="${S_DSCP_NAME[$i]:-CS0}"
+            [[ -z "$dscp_disp" ]] && dscp_disp="CS0"
+
+            local st_col
+            case "$st" in
+                CONNECTED) st_col="${GREEN}${st}${NC}"  ;;
+                DONE)      st_col="${CYAN}${st}${NC}"   ;;
+                FAILED)    st_col="${RED}${st}${NC}"    ;;
+                *)         st_col="${YELLOW}${st}${NC}" ;;
+            esac
+
+            local pfx
+            pfx=$(printf '%-3d  %-5s  %-16s  %-6s  %-8s  ' \
+                "$sn" "${S_PROTO[$i]}" "$tgt" "${S_PORT[$i]}" "$dscp_disp")
+            bleft " ${pfx}${st_col}"
+        done
+
+        printf '+%s+\n' "$(rpt '=' "$inner")"
+        printf '\n'
+
+        local sel_raw sel_lower
+        while true; do
+            read -r -p "  Stream number to verify (or q to cancel): " sel_raw </dev/tty
+            # Portable lowercase — tr instead of ${var,,}
+            sel_lower=$(printf '%s' "$sel_raw" | tr '[:upper:]' '[:lower:]')
+            [[ "$sel_lower" == "q" || -z "$sel_raw" ]] && {
+                printf '\033[?25l'
+                return 0
+            }
+            if [[ "$sel_raw" =~ ^[0-9]+$ ]] && \
+               (( 10#$sel_raw >= 1 && 10#$sel_raw <= STREAM_COUNT )); then
+                selected_idx=$(( 10#$sel_raw - 1 ))
+                break
+            fi
+            printf '%b\n' "${RED}  Enter a number 1-${STREAM_COUNT} or q to cancel.${NC}"
+        done
+    fi
+
+    _dscp_verify_run "$selected_idx"
+
+    printf '\n'
+    read -r -p "  Press Enter to return to dashboard..." </dev/tty
+
+    printf '\033[?25l'
+    return 0
+}
+# =============================================================================
 # SECTION 11 — STATUS ENGINE
 # =============================================================================
 
@@ -2959,11 +3744,34 @@ probe_server_status() {
     fi
 
     local prev_state="${SRV_PREV_STATE[$idx]:-}"
-    if [[ "$prev_state" == "CONNECTED" && "$current_state" != "CONNECTED" ]]; then
-        SRV_BW_CACHE[$idx]="---"
-    fi
-    SRV_PREV_STATE[$idx]="$current_state"
 
+    # ── Bandwidth cache reset policy ──────────────────────────────────────
+    #
+    # Reset the BW cache ONLY when the server transitions from CONNECTED
+    # to LISTENING or STARTING. This means a client fully disconnected
+    # and the server has returned to waiting with no active connection.
+    #
+    # Do NOT reset when transitioning CONNECTED → RUNNING:
+    #   RUNNING means the server accepted the connection and is either
+    #   still processing or just finished — the cached BW from that
+    #   connection is still meaningful and should be shown.
+    #
+    # Do NOT reset when staying in RUNNING:
+    #   The server may cycle CONNECTED → RUNNING between client connections.
+    #   Retaining the cached BW provides continuity in the dashboard.
+    #
+    if [[ "$prev_state" == "CONNECTED" ]]; then
+        case "$current_state" in
+            LISTENING|STARTING)
+                # Client fully gone, server back to waiting — clear BW
+                SRV_BW_CACHE[$idx]="---"
+                ;;
+            # RUNNING, CONNECTED: retain cache — connection still active or
+            # just completed, BW is still relevant
+        esac
+    fi
+
+    SRV_PREV_STATE[$idx]="$current_state"
     printf '%s' "$current_state"
 }
 
@@ -3116,23 +3924,43 @@ _render_completed_panel() {
     done
     (( done_count == 0 )) && return
 
+    # ── Dynamic target column width ───────────────────────────────────────
+    # Same calculation as _render_client_frame so columns are consistent.
+    # Panel layout:
+    #   " " + sn(3) + "  " + proto(5) + "  " + target(W) + "  " +
+    #   port(5) + "  " + sender(14) + "  " + receiver(14)
+    #   = 1+3+2+5+2+W+2+5+2+14+2+14 = 52+W  must fit in COLS-2 (78)
+    #   → W <= 26  (generous — use same cap as live dashboard for consistency)
+    local _tgt_col_w=14
+    for (( i=0; i<STREAM_COUNT; i++ )); do
+        [[ "${S_STATUS_CACHE[$i]}" != "DONE" ]] && continue
+        local _tlen=${#S_TARGET[$i]}
+        (( _tlen > _tgt_col_w )) && _tgt_col_w=$_tlen
+    done
+    local _tgt_max=$(( COLS - 54 ))
+    (( _tgt_max < 14 )) && _tgt_max=14
+    (( _tgt_col_w > _tgt_max )) && _tgt_col_w=$_tgt_max
+
     printf '+%s+\033[K\n' "$(rpt '=' $(( COLS - 2 )))"
     bcenter "${BOLD}${CYAN}Completed Streams${NC}"
     printf '+%s+\033[K\n' "$(rpt '=' $(( COLS - 2 )))"
-    bleft "${BOLD}$(printf '%-3s  %-5s  %-14s  %-5s  %-14s  %-14s' \
-        '#' 'Proto' 'Target' 'Port' 'Sender BW' 'Receiver BW')${NC}"
+    bleft "${BOLD}$(printf '%-3s  %-5s  %-*s  %-5s  %-14s  %-14s' \
+        '#' 'Proto' "$_tgt_col_w" 'Target' 'Port' 'Sender BW' \
+        'Receiver BW')${NC}"
     printf '+%s+\033[K\n' "$(rpt '-' $(( COLS - 2 )))"
 
     for (( i=0; i<STREAM_COUNT; i++ )); do
         [[ "${S_STATUS_CACHE[$i]}" != "DONE" ]] && continue
         local sn=$(( i + 1 ))
         local tgt="${S_TARGET[$i]:-?}"
-        (( ${#tgt} > 14 )) && tgt="${tgt:0:13}~"
+        if (( ${#tgt} > _tgt_col_w )); then
+            tgt="${tgt:0:$(( _tgt_col_w - 1 ))}~"
+        fi
         local sbw="${S_FINAL_SENDER_BW[$i]:-N/A}"
         local rbw="${S_FINAL_RECEIVER_BW[$i]:-N/A}"
         local pfx
-        pfx=$(printf '%-3d  %-5s  %-14s  %-5s  ' \
-            "$sn" "${S_PROTO[$i]}" "$tgt" "${S_PORT[$i]}")
+        pfx=$(printf '%-3d  %-5s  %-*s  %-5s  ' \
+            "$sn" "${S_PROTO[$i]}" "$_tgt_col_w" "$tgt" "${S_PORT[$i]}")
         bleft " ${pfx}${GREEN}$(printf '%-14s' "$sbw")${NC}  ${CYAN}$(printf '%-14s' "$rbw")${NC}"
     done
     printf '+%s+\033[K\n' "$(rpt '=' $(( COLS - 2 )))"
@@ -3300,7 +4128,27 @@ _render_client_frame() {
     local fts="${S_START_TS[0]:-0}"; (( fts == 0 )) && fts="$now"
     local efmt; efmt=$(format_seconds $(( now - fts )))
 
-    # Detect whether any stream has a fixed duration (used for sub-header)
+    # ── Dynamic target column width ───────────────────────────────────────
+    # Calculate the minimum width needed to display all targets without
+    # truncation, capped so the total row fits within COLS (80).
+    #
+    # Row layout (characters):
+    #   " " + sn(3) + "  " + proto(5) + "  " + target(W) + "  " +
+    #   port(5) + "  " + bw(11) + "  " + time(6) + "  " + dscp(5) +
+    #   "  " + status(9) = 1+3+2+5+2+W+2+5+2+11+2+6+2+5+2+9 = 59+W
+    # Box overhead (| on each side + 1 indent) = 3
+    # Total = 62 + W  must be <= COLS (80)  →  W <= 18
+    # Minimum useful width = 13 (fits "192.168.1.1" + some)
+    local _tgt_col_w=13
+    for (( i=0; i<STREAM_COUNT; i++ )); do
+        local _tlen=${#S_TARGET[$i]}
+        (( _tlen > _tgt_col_w )) && _tgt_col_w=$_tlen
+    done
+    # Cap to fit in 80-column box
+    local _tgt_max=$(( COLS - 62 ))
+    (( _tgt_col_w > _tgt_max )) && _tgt_col_w=$_tgt_max
+    (( _tgt_col_w < 13 )) && _tgt_col_w=13
+
     local has_fixed_dur=0
     for (( i=0; i<STREAM_COUNT; i++ )); do
         (( S_DURATION[$i] > 0 )) && has_fixed_dur=1 && break
@@ -3313,11 +4161,14 @@ _render_client_frame() {
     bleft "  $(printf 'Active:%-2d  Connected:%-2d  Done:%-2d  Failed:%-2d  Elapsed:%s' \
         "$act" "$nc" "$nd" "$nf" "$efmt")"
     print_separator
-    bleft "${BOLD}$(printf '%-3s  %-5s  %-13s  %-5s  %-11s  %-6s  %-5s  %-9s' \
-        '#' 'Proto' 'Target' 'Port' 'Bandwidth' 'Time' 'DSCP' 'Status')${NC}"
+
+    # Column header uses dynamic target width
+    bleft "${BOLD}$(printf '%-3s  %-5s  %-*s  %-5s  %-11s  %-6s  %-5s  %-9s' \
+        '#' 'Proto' "$_tgt_col_w" 'Target' 'Port' 'Bandwidth' 'Time' 'DSCP' \
+        'Status')${NC}"
     if (( has_fixed_dur )); then
-        bleft "${DIM}$(printf '%-3s  %-5s  %-13s  %-5s  %-11s  %-29s' \
-            '' '' '' '' '' 'Progress')${NC}"
+        bleft "${DIM}$(printf '%-3s  %-5s  %-*s  %-5s  %-11s  %-29s' \
+            '' '' "$_tgt_col_w" '' '' '' 'Progress')${NC}"
     fi
     print_separator
 
@@ -3379,23 +4230,26 @@ _render_client_frame() {
             *)          sb="$st"        sc="$NC"     ;;
         esac
 
+        # Truncate target only when it exceeds the dynamic column width
         local tgt="${S_TARGET[$i]:-?}"
-        (( ${#tgt} > 13 )) && tgt="${tgt:0:12}~"
+        if (( ${#tgt} > _tgt_col_w )); then
+            tgt="${tgt:0:$(( _tgt_col_w - 1 ))}~"
+        fi
 
-        # Main data row
+        # Main data row uses dynamic target width
         local pfx
-        pfx=$(printf '%-3d  %-5s  %-13s  %-5s  %-11s  %-6s  %-5s  ' \
-            "$sn" "${S_PROTO[$i]}" "$tgt" "${S_PORT[$i]}" \
+        pfx=$(printf '%-3d  %-5s  %-*s  %-5s  %-11s  %-6s  %-5s  ' \
+            "$sn" "${S_PROTO[$i]}" "$_tgt_col_w" "$tgt" "${S_PORT[$i]}" \
             "$bw" "$td" "$dscp_display")
         bleft " ${pfx}${sc}${sb}${NC}"
 
-        # Progress bar row — only for fixed-duration non-failed streams
+        # Progress bar row — indent matches target column width
         if (( show_bar && has_fixed_dur )); then
             local bar_str
             bar_str=$(_render_progress_bar "$stream_elapsed" "$dur")
             local bar_prefix
-            bar_prefix=$(printf ' %-3s  %-5s  %-13s  %-5s  %-11s  ' \
-                '' '' '' '' '')
+            bar_prefix=$(printf ' %-3s  %-5s  %-*s  %-5s  %-11s  ' \
+                '' '' "$_tgt_col_w" '' '' '')
             bleft " ${bar_prefix}${bar_str}"
         fi
     done
@@ -3425,32 +4279,69 @@ _render_server_frame() {
         local sn=$(( i + 1 )) lf="${SRV_LOGFILE[$i]:-}"
         local st; st=$(probe_server_status "$i")
 
+        # ── Bandwidth display logic ───────────────────────────────────────
+        #
+        # CONNECTED or RUNNING:
+        #   Try to parse a live bandwidth sample from the log.
+        #   If a new sample is available, update the cache and display it.
+        #   If no new sample, display the cached value (last known BW).
+        #   This retains the previous connection's bandwidth while the
+        #   server is in RUNNING state waiting for the next client.
+        #
+        # LISTENING or STARTING:
+        #   No client has connected yet (or server just started).
+        #   Clear the cache and show "---" — there is no meaningful
+        #   bandwidth figure to display.
+        #
+        # DONE or FAILED:
+        #   Show "---" — listener is no longer active.
+
         local bw
-        if [[ "$st" == "CONNECTED" || "$st" == "RUNNING" ]]; then
-            local live_bw
-            live_bw=$(parse_live_bandwidth_from_log "$lf")
-            if [[ "$live_bw" != "---" && -n "$live_bw" ]]; then
-                bw="$live_bw"
-                SRV_BW_CACHE[$i]="$live_bw"
-            else
-                bw="${SRV_BW_CACHE[$i]:----}"
-            fi
-        else
-            bw="---"
-            SRV_BW_CACHE[$i]="---"
-        fi
+        case "$st" in
+            CONNECTED|RUNNING)
+                local live_bw
+                live_bw=$(parse_live_bandwidth_from_log "$lf")
+                if [[ "$live_bw" != "---" && -n "$live_bw" ]]; then
+                    # Fresh live sample available — update cache
+                    bw="$live_bw"
+                    SRV_BW_CACHE[$i]="$live_bw"
+                else
+                    # No live sample — retain cached value from last
+                    # active connection (may be from previous client)
+                    bw="${SRV_BW_CACHE[$i]:----}"
+                fi
+                ;;
+            LISTENING|STARTING)
+                # No client has ever connected to this listener in the
+                # current session, or server is initialising.
+                # Clear cache and show placeholder.
+                bw="---"
+                SRV_BW_CACHE[$i]="---"
+                ;;
+            *)
+                # DONE, FAILED, or unknown
+                bw="---"
+                ;;
+        esac
 
         local sb sc
         case "$st" in
-            CONNECTED) sb="CONNECTED" sc="$GREEN"  ;; RUNNING)  sb="RUNNING"  sc="$CYAN"   ;;
-            LISTENING) sb="LISTENING" sc="$BLUE"   ;; STARTING) sb="STARTING" sc="$YELLOW" ;;
-            DONE)      sb="DONE"      sc="$NC"     ;; FAILED)   sb="FAILED"   sc="$RED"    ;;
+            CONNECTED) sb="CONNECTED" sc="$GREEN"  ;;
+            RUNNING)   sb="RUNNING"   sc="$CYAN"   ;;
+            LISTENING) sb="LISTENING" sc="$BLUE"   ;;
+            STARTING)  sb="STARTING"  sc="$YELLOW" ;;
+            DONE)      sb="DONE"      sc="$NC"     ;;
+            FAILED)    sb="FAILED"    sc="$RED"    ;;
             *)         sb="$st"       sc="$NC"     ;;
         esac
-        local vrf_disp="${SRV_VRF[$i]:-GRT}"; [[ "$OS_TYPE" == "macos" ]] && vrf_disp="N/A"
+
+        local vrf_disp="${SRV_VRF[$i]:-GRT}"
+        [[ "$OS_TYPE" == "macos" ]] && vrf_disp="N/A"
+
         local pfx
         pfx=$(printf '%-3d  %-6s  %-16s  %-10s  %-12s  ' \
-            "$sn" "${SRV_PORT[$i]}" "${SRV_BIND[$i]:-0.0.0.0}" "$vrf_disp" "$bw")
+            "$sn" "${SRV_PORT[$i]}" "${SRV_BIND[$i]:-0.0.0.0}" \
+            "$vrf_disp" "$bw")
         bleft " ${pfx}${sc}${sb}${NC}"
     done
 
@@ -3464,10 +4355,7 @@ run_dashboard() {
     local count
     [[ "$mode" == "server" ]] && count=$SERVER_COUNT || count=$STREAM_COUNT
 
-    # ── Probe status BEFORE calculating pre-reserve ───────────────────────
-    # Must run first so S_STATUS_CACHE is populated and
-    # _count_client_frame_lines_for_state returns the correct count
-    # for the first render.
+    # Probe status BEFORE calculating pre-reserve size
     if [[ "$mode" != "server" ]]; then
         local j
         for (( j=0; j<STREAM_COUNT; j++ )); do
@@ -3475,15 +4363,7 @@ run_dashboard() {
         done
     fi
 
-    # ── Pre-reserve exactly the lines the first render will print ─────────
-    # Do NOT add panel worst-case here.  The panels grow below the fixed
-    # frame and are cleared by \033[J on each tick — they do not need
-    # pre-reserved space.
-    #
-    # Pre-reserving more than the first render will cause the terminal to
-    # scroll if the excess exceeds the remaining viewport height, which
-    # makes \033[NA clamp at the top of the scroll region and breaks
-    # cursor positioning.
+    # Calculate exact pre-reserve size
     local pre_lines
     if [[ "$mode" == "server" ]]; then
         pre_lines=$(( 10 + count ))
@@ -3493,13 +4373,8 @@ run_dashboard() {
 
     FRAME_LINES=$pre_lines
     _PREV_DYNAMIC_LINES=0
-
-    # _last_total: total lines rendered last tick (frame + panels)
-    # Initialised to pre_lines so tick 2 cursor-up is correct even if
-    # tick 1 renders a different count (should not happen but safe).
     local _last_total=$pre_lines
 
-    # Print blank lines and move cursor back to top
     local k
     for (( k=0; k<pre_lines; k++ )); do printf '\n'; done
     printf '\033[%dA' "$pre_lines"
@@ -3508,7 +4383,7 @@ run_dashboard() {
     local first_tick=1
 
     while true; do
-        # ── Probe status (skip on tick 1 — already done above) ────────────
+        # Probe (skip on tick 1 — already done before pre-reserve)
         if (( first_tick == 0 )) && [[ "$mode" != "server" ]]; then
             local j
             for (( j=0; j<STREAM_COUNT; j++ )); do
@@ -3516,31 +4391,26 @@ run_dashboard() {
             done
         fi
 
-        # ── Move cursor to top of last rendered block ──────────────────────
-        # Tick 1: cursor already at top from pre-reserve — skip.
-        # Tick 2+: move up by exact total lines rendered last tick.
+        # Move cursor to top of last rendered block
         if (( first_tick == 0 )); then
             printf '\033[%dA' "$_last_total"
         fi
         first_tick=0
 
-        # ── Render fixed frame ────────────────────────────────────────────
+        # Render fixed frame
         local fixed_lines
         if [[ "$mode" == "server" ]]; then
             _render_server_frame
             fixed_lines=$(( 10 + SERVER_COUNT ))
         else
             _render_client_frame
-            # Count after render so bar/sub-hdr state is accurate
             fixed_lines=$(_count_client_frame_lines_for_state)
         fi
 
-        # ── Erase from cursor to end of screen ───────────────────────────
-        # Clears stale dynamic panel rows and any leftover pre-reserved
-        # blank lines below the current frame.
+        # Erase from cursor to end of screen
         printf '\033[J'
 
-        # ── Render dynamic panels (client only) ───────────────────────────
+        # Render dynamic panels (client only)
         local completed_lines=0 failed_lines=0
         if [[ "$mode" != "server" ]]; then
             completed_lines=$(_count_completed_panel_lines)
@@ -3549,12 +4419,30 @@ run_dashboard() {
             (( failed_lines    > 0 )) && _render_failed_panel
         fi
 
-        # ── Record total for next tick's cursor-up ────────────────────────
+        # ── DSCP verification hint (client mode, when streams are CONNECTED) ──
+        local _hint_lines=0
+        if [[ "$mode" != "server" ]]; then
+            local _any_connected=0
+            local _ji
+            for (( _ji=0; _ji<STREAM_COUNT; _ji++ )); do
+                [[ "${S_STATUS_CACHE[$_ji]}" == "CONNECTED" ]] && \
+                    _any_connected=1 && break
+            done
+            if (( _any_connected )); then
+                printf '\033[K\n'
+                printf '  %b[v/p]%b  Verify DSCP marking for a stream\033[K\n' \
+                    "$DIM" "$NC"
+                printf '\033[K\n'
+                _hint_lines=3
+            fi
+        fi
+
+        # Record total lines rendered this tick
         local dynamic_lines=$(( completed_lines + failed_lines ))
-        _last_total=$(( fixed_lines + dynamic_lines ))
+        _last_total=$(( fixed_lines + dynamic_lines + _hint_lines ))
         _PREV_DYNAMIC_LINES=$dynamic_lines
 
-        # ── Check whether all processes have finished ─────────────────────
+        # Check whether all processes have finished
         local any=0
         if [[ "$mode" == "server" ]]; then
             local j
@@ -3571,7 +4459,52 @@ run_dashboard() {
         fi
 
         (( any == 0 )) && break
-        sleep 1
+
+        # ── Non-blocking keyboard check ───────────────────────────────────
+        # Poll stdin for a keypress during the 1-second tick.
+        # Split into 10 × 0.1s checks so we respond within 0.1s.
+        # Use tr for lowercase conversion — bash 3.2 compatible.
+        local key_pressed=""
+        local key_lower=""
+        local tick_slice
+        for (( tick_slice=0; tick_slice<10; tick_slice++ )); do
+            if IFS= read -r -s -n 1 -t 0.1 key_pressed </dev/tty 2>/dev/null; then
+                # Convert to lowercase using tr — works on bash 3.2 and 4+
+                key_lower=$(printf '%s' "$key_pressed" | tr '[:upper:]' '[:lower:]')
+                break
+            fi
+            key_pressed=""
+            key_lower=""
+        done
+
+        # ── Handle DSCP verification keypress (client mode only) ──────────
+        if [[ "$mode" != "server" ]] && \
+           [[ "$key_lower" == "v" || "$key_lower" == "p" ]]; then
+
+            # Restore cursor and move below the rendered content
+            printf '\033[?25h'
+            printf '\033[%dB' "$_last_total"
+
+            _dscp_verify_interactive
+
+            # After returning, re-probe streams and recalculate frame size
+            local j
+            for (( j=0; j<STREAM_COUNT; j++ )); do
+                probe_client_status "$j"
+            done
+
+            local new_pre
+            new_pre=$(_count_client_frame_lines_for_state)
+            FRAME_LINES=$new_pre
+
+            # Re-reserve space and reposition cursor for clean redraw
+            for (( k=0; k<new_pre; k++ )); do printf '\n'; done
+            printf '\033[%dA' "$new_pre"
+            printf '\033[?25l'
+
+            _last_total=$new_pre
+            first_tick=1
+        fi
     done
 
     printf '\033[?25h'
