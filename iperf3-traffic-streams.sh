@@ -1122,6 +1122,8 @@ configure_client_streams() {
         done
         S_PROTO+=("$proto")
 
+        # ── Target ───────────────────────────────────────────────────────────
+
         local tprompt
         [[ -n "$lt" ]] \
             && tprompt="  Target server IP/hostname [$lt]" \
@@ -1130,14 +1132,126 @@ configure_client_streams() {
         while true; do
             read -r -p "${tprompt}: " tgt </dev/tty
             tgt="${tgt:-$lt}"
+
+            # ── Empty input ───────────────────────────────────────────────────
             if [[ -z "$tgt" ]]; then
-                printf '%b\n' "${RED}  Target is required.${NC}"; continue
+                printf '%b\n' "${RED}  Target is required. Enter a valid IP address.${NC}"
+                continue
             fi
-            validate_ip "$tgt" || \
-                printf '%b\n' "${YELLOW}  Warning: '${tgt}' may not be valid. Continuing.${NC}"
+
+            # ── Must be a valid IP address ────────────────────────────────────
+            # Hostnames are no longer accepted silently with a warning.
+            # The target must be a syntactically valid IPv4 address.
+            if ! validate_ip "$tgt"; then
+                printf '%b\n' \
+                    "${RED}  '${tgt}' is not a valid IPv4 address.${NC}"
+                printf '%b\n' \
+                    "${RED}  Enter a valid IP address (e.g. 192.168.1.10).${NC}"
+                continue
+            fi
+
+            # ── Reserved / non-routable address check ─────────────────────────
+            # Reject addresses that are reserved, unspecified, broadcast,
+            # or otherwise not valid unicast destinations:
+            #
+            #   0.x.x.x          "This network" — RFC 1122
+            #   127.x.x.x        Loopback — allowed only in loopback test mode
+            #   169.254.x.x      Link-local (APIPA) — RFC 3927
+            #   192.0.2.x        TEST-NET-1 — RFC 5737
+            #   198.51.100.x     TEST-NET-2 — RFC 5737
+            #   203.0.113.x      TEST-NET-3 — RFC 5737
+            #   198.18.x.x /
+            #   198.19.x.x       Benchmarking — RFC 2544
+            #   240.x.x.x        Reserved — RFC 1112
+            #   255.x.x.x        Broadcast / reserved
+            #   x.x.x.0          Network address (last octet = 0)
+            #   x.x.x.255        Broadcast address (last octet = 255)
+            #
+            # Private RFC 1918 ranges (10.x, 172.16-31.x, 192.168.x) ARE
+            # allowed — they are valid unicast targets in enterprise networks.
+            # Multicast (224-239.x.x.x) is rejected — not a valid iperf3 target.
+
+            local _o1 _o2 _o3 _o4
+            IFS='.' read -r _o1 _o2 _o3 _o4 <<< "$tgt"
+            local _reserved=0
+            local _reserved_reason=""
+
+            # 0.x.x.x — "this network"
+            if (( 10#$_o1 == 0 )); then
+                _reserved=1
+                _reserved_reason="0.0.0.0/8 is the 'this network' range (RFC 1122)"
+
+            # 127.x.x.x — loopback
+            elif (( 10#$_o1 == 127 )); then
+                _reserved=1
+                _reserved_reason="127.0.0.0/8 is the loopback range — use Loopback Test mode (menu option 4) instead"
+
+            # 169.254.x.x — link-local
+            elif (( 10#$_o1 == 169 && 10#$_o2 == 254 )); then
+                _reserved=1
+                _reserved_reason="169.254.0.0/16 is the link-local (APIPA) range (RFC 3927)"
+
+            # 192.0.2.x — TEST-NET-1
+            elif (( 10#$_o1 == 192 && 10#$_o2 == 0 && 10#$_o3 == 2 )); then
+                _reserved=1
+                _reserved_reason="192.0.2.0/24 is TEST-NET-1 — documentation range (RFC 5737)"
+
+            # 198.51.100.x — TEST-NET-2
+            elif (( 10#$_o1 == 198 && 10#$_o2 == 51 && 10#$_o3 == 100 )); then
+                _reserved=1
+                _reserved_reason="198.51.100.0/24 is TEST-NET-2 — documentation range (RFC 5737)"
+
+            # 203.0.113.x — TEST-NET-3
+            elif (( 10#$_o1 == 203 && 10#$_o2 == 0 && 10#$_o3 == 113 )); then
+                _reserved=1
+                _reserved_reason="203.0.113.0/24 is TEST-NET-3 — documentation range (RFC 5737)"
+
+            # 198.18.x.x and 198.19.x.x — benchmarking
+            elif (( 10#$_o1 == 198 && ( 10#$_o2 == 18 || 10#$_o2 == 19 ) )); then
+                _reserved=1
+                _reserved_reason="198.18.0.0/15 is the benchmarking range (RFC 2544)"
+
+            # 224-239.x.x.x — multicast
+            elif (( 10#$_o1 >= 224 && 10#$_o1 <= 239 )); then
+                _reserved=1
+                _reserved_reason="${tgt} is in the multicast range (224.0.0.0/4) — not a valid iperf3 target"
+
+            # 240-254.x.x.x — reserved
+            elif (( 10#$_o1 >= 240 && 10#$_o1 <= 254 )); then
+                _reserved=1
+                _reserved_reason="${tgt} is in the reserved range (240.0.0.0/4 — RFC 1112)"
+
+            # 255.x.x.x — broadcast / reserved
+            elif (( 10#$_o1 == 255 )); then
+                _reserved=1
+                _reserved_reason="255.x.x.x is a broadcast/reserved range"
+
+            # x.x.x.0 — network address (last octet 0)
+            elif (( 10#$_o4 == 0 )); then
+                _reserved=1
+                _reserved_reason="${tgt} ends in .0 — this is typically a network address, not a host"
+
+            # x.x.x.255 — broadcast address (last octet 255)
+            elif (( 10#$_o4 == 255 )); then
+                _reserved=1
+                _reserved_reason="${tgt} ends in .255 — this is typically a broadcast address, not a host"
+            fi
+
+            if (( _reserved )); then
+                printf '%b\n' \
+                    "${RED}  '${tgt}' is not a valid target address.${NC}"
+                printf '%b\n' \
+                    "${RED}  Reason: ${_reserved_reason}.${NC}"
+                printf '%b\n' \
+                    "${RED}  Enter a valid unicast IP address.${NC}"
+                continue
+            fi
+
+            # ── Valid IP accepted ─────────────────────────────────────────────
             break
         done
-        lt="$tgt"; S_TARGET+=("$tgt")
+        lt="$tgt"
+        S_TARGET+=("$tgt")
 
         local dp=$(( lp + 1 )) port
         while true; do
@@ -3397,6 +3511,32 @@ _dscp_verify_interactive() {
     printf '\033[?25h'
     printf '\n'
 
+    # Guard: check whether any non-loopback stream exists
+    local _has_verifiable=0
+    local _vi
+    for (( _vi=0; _vi<STREAM_COUNT; _vi++ )); do
+        if [[ ! "${S_TARGET[$_vi]:-}" =~ ^127\. ]] && \
+           [[ "${S_TARGET[$_vi]:-}" != "::1" ]]; then
+            _has_verifiable=1
+            break
+        fi
+    done
+
+    if (( _has_verifiable == 0 )); then
+        printf '\n'
+        printf '+%s+\n' "$(rpt '=' "$inner")"
+        bcenter "${BOLD}${CYAN}DSCP Marking Verification${NC}"
+        printf '+%s+\n' "$(rpt '=' "$inner")"
+        bleft "  ${YELLOW}⚠ All streams are targeting loopback (127.x.x.x).${NC}"
+        bleft "  ${DIM}DSCP verification via tcpdump is not applicable for loopback traffic.${NC}"
+        bleft "  ${DIM}Configure streams to non-loopback targets to use this feature.${NC}"
+        printf '+%s+\n' "$(rpt '=' "$inner")"
+        printf '\n'
+        read -r -p "  Press Enter to return to dashboard..." </dev/tty
+        printf '\033[?25l'
+        return 0
+    fi
+
     # Check tcpdump availability early
     local tcpdump_check
     tcpdump_check=$(_dscp_verify_check_tcpdump)
@@ -3425,12 +3565,24 @@ _dscp_verify_interactive() {
         return 1
     fi
 
-    # Select stream
+    # Select stream — only from non-loopback streams
     local selected_idx=-1
 
-    if (( STREAM_COUNT == 1 )); then
-        selected_idx=0
+    # Build a list of selectable (non-loopback) stream indices
+    local -a verifiable_indices=()
+    local _vi2
+    for (( _vi2=0; _vi2<STREAM_COUNT; _vi2++ )); do
+        if [[ ! "${S_TARGET[$_vi2]:-}" =~ ^127\. ]] && \
+           [[ "${S_TARGET[$_vi2]:-}" != "::1" ]]; then
+            verifiable_indices+=("$_vi2")
+        fi
+    done
+
+    if (( ${#verifiable_indices[@]} == 1 )); then
+        # Only one eligible stream — select automatically
+        selected_idx="${verifiable_indices[0]}"
     else
+        # Multiple eligible streams — show selection menu
         printf '\n'
         printf '+%s+\n' "$(rpt '=' "$inner")"
         bcenter "${BOLD}${CYAN}DSCP Marking Verification — Select Stream${NC}"
@@ -3439,13 +3591,13 @@ _dscp_verify_interactive() {
             '#' 'Proto' 'Target' 'Port' 'DSCP' 'Status')${NC}"
         printf '+%s+\n' "$(rpt '-' "$inner")"
 
-        local i
-        for (( i=0; i<STREAM_COUNT; i++ )); do
-            local sn=$(( i + 1 ))
-            local st="${S_STATUS_CACHE[$i]:-STARTING}"
-            local tgt="${S_TARGET[$i]:-?}"
+        local _vidx
+        for _vidx in "${verifiable_indices[@]}"; do
+            local sn=$(( _vidx + 1 ))
+            local st="${S_STATUS_CACHE[$_vidx]:-STARTING}"
+            local tgt="${S_TARGET[$_vidx]:-?}"
             (( ${#tgt} > 16 )) && tgt="${tgt:0:15}~"
-            local dscp_disp="${S_DSCP_NAME[$i]:-CS0}"
+            local dscp_disp="${S_DSCP_NAME[$_vidx]:-CS0}"
             [[ -z "$dscp_disp" ]] && dscp_disp="CS0"
 
             local st_col
@@ -3458,7 +3610,8 @@ _dscp_verify_interactive() {
 
             local pfx
             pfx=$(printf '%-3d  %-5s  %-16s  %-6s  %-8s  ' \
-                "$sn" "${S_PROTO[$i]}" "$tgt" "${S_PORT[$i]}" "$dscp_disp")
+                "$sn" "${S_PROTO[$_vidx]}" "$tgt" \
+                "${S_PORT[$_vidx]}" "$dscp_disp")
             bleft " ${pfx}${st_col}"
         done
 
@@ -3468,7 +3621,6 @@ _dscp_verify_interactive() {
         local sel_raw sel_lower
         while true; do
             read -r -p "  Stream number to verify (or q to cancel): " sel_raw </dev/tty
-            # Portable lowercase — tr instead of ${var,,}
             sel_lower=$(printf '%s' "$sel_raw" | tr '[:upper:]' '[:lower:]')
             [[ "$sel_lower" == "q" || -z "$sel_raw" ]] && {
                 printf '\033[?25l'
@@ -3476,10 +3628,19 @@ _dscp_verify_interactive() {
             }
             if [[ "$sel_raw" =~ ^[0-9]+$ ]] && \
                (( 10#$sel_raw >= 1 && 10#$sel_raw <= STREAM_COUNT )); then
-                selected_idx=$(( 10#$sel_raw - 1 ))
+                local _candidate=$(( 10#$sel_raw - 1 ))
+                # Verify selected stream is not loopback
+                if [[ "${S_TARGET[$_candidate]:-}" =~ ^127\. ]] || \
+                   [[ "${S_TARGET[$_candidate]:-}" == "::1" ]]; then
+                    printf '%b\n' \
+                        "${YELLOW}  Stream ${sel_raw} targets loopback — not eligible for DSCP verification.${NC}"
+                    continue
+                fi
+                selected_idx=$_candidate
                 break
             fi
-            printf '%b\n' "${RED}  Enter a number 1-${STREAM_COUNT} or q to cancel.${NC}"
+            printf '%b\n' \
+                "${RED}  Enter a stream number 1-${STREAM_COUNT} or q to cancel.${NC}"
         done
     fi
 
@@ -4420,15 +4581,23 @@ run_dashboard() {
         fi
 
         # ── DSCP verification hint (client mode, when streams are CONNECTED) ──
+        # Only shown when at least one CONNECTED stream targets a non-loopback
+        # address. Loopback tests (127.x.x.x) do not benefit from tcpdump
+        # DSCP verification so the hint is suppressed entirely.
         local _hint_lines=0
         if [[ "$mode" != "server" ]]; then
-            local _any_connected=0
+            local _any_verifiable=0
             local _ji
             for (( _ji=0; _ji<STREAM_COUNT; _ji++ )); do
-                [[ "${S_STATUS_CACHE[$_ji]}" == "CONNECTED" ]] && \
-                    _any_connected=1 && break
+                # Must be CONNECTED and target must not be loopback
+                if [[ "${S_STATUS_CACHE[$_ji]}" == "CONNECTED" ]] && \
+                   [[ ! "${S_TARGET[$_ji]:-}" =~ ^127\. ]] && \
+                   [[ "${S_TARGET[$_ji]:-}" != "::1" ]]; then
+                    _any_verifiable=1
+                    break
+                fi
             done
-            if (( _any_connected )); then
+            if (( _any_verifiable )); then
                 printf '\033[K\n'
                 printf '  %b[v/p]%b  Verify DSCP marking for a stream\033[K\n' \
                     "$DIM" "$NC"
