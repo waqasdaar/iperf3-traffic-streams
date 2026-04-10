@@ -1357,7 +1357,7 @@ After all checks complete, a consolidated results table is displayed:
 
 ```
 +==============================================================================+
-| Pre-Flight Results |
+| Pre-Flight Results                                                           |
 +==============================================================================+
 | # Target Port Proto VRF Result RTT min/avg/max Loss TCP Port                 |
 +------------------------------------------------------------------------------+
@@ -1371,7 +1371,7 @@ After all checks complete, a consolidated results table is displayed:
 
 #### Traceroute Path Discovery Output
 
-```
+
 +==============================================================================+
 | Path Discovery — Traceroute                                                  |
 +==============================================================================+
@@ -1392,8 +1392,6 @@ After all checks complete, a consolidated results table is displayed:
 | 1 10.10.114.1                    0.33 ms                                     |
 +==============================================================================+
 ```
-
----
 
 #### Failure and Warning Detail Panel
 
@@ -1497,7 +1495,7 @@ running on `192.168.1.10:5201`.
 
 Checking 192.168.1.10:5201 (TCP / GRT)...
 
-
+```
 +==============================================================================+
 | Pre-Flight Results                                                           |
 +==============================================================================+
@@ -1516,7 +1514,7 @@ Checking 192.168.1.10:5201 (TCP / GRT)...
 | 1 192.168.1.1                      0.28 ms                                   |
 | 2 192.168.1.10                     0.31 ms                                   |
 +==============================================================================+
-
+```
 
 All pre-flight checks PASSED. Proceeding to launch streams.
 
@@ -1553,9 +1551,48 @@ sudo ip vrf exec vrf10 traceroute 192.168.114.200
 sudo ip vrf exec vrf10 traceroute 192.168.114.201
 ```
 
-`sudo authentication required for VRF traceroute (ip vrf exec vrf10)`
+sudo authentication required for VRF traceroute (ip vrf exec vrf10)
+
   **Please enter your sudo password:**
+
   **sudo credential cached successfully.**
+
+  Checking  192.168.114.200:5201  (TCP / VRF:vrf10)...
+  Checking  192.168.114.201:5202  (UDP / VRF:vrf10)...
+```
++==============================================================================+
+|                            Pre-Flight Results                                |
++==============================================================================+
+|  1    192.168.114.200    5201   TCP    vrf10     PASS    0.41/0.52/0.71 ms   0%      PASS      |
+|  2    192.168.114.201    5202   UDP    vrf10     PASS    0.44/0.55/0.68 ms   0%      SKIP      |
++==============================================================================+
+
++==============================================================================+
+|                         Path Discovery — Traceroute                          |
++==============================================================================+
+|   Target: 192.168.114.200  (VRF: vrf10)                                      |
+|   Command: sudo ip vrf exec vrf10 traceroute 192.168.114.200                 |
++------------------------------------------------------------------------------+
+|   1     192.168.110.100                           0.41 ms                    |
+|   2     10.48.35.24                               1.60 ms                    |
+|   3     192.168.114.200                           1.58 ms                    |
++==============================================================================+
+|   Target: 192.168.114.201  (VRF: vrf10)                                      |
+|   Command: sudo ip vrf exec vrf10 traceroute 192.168.114.201                 |
++------------------------------------------------------------------------------+
+|   1     192.168.110.100                           0.41 ms                    |
+|   2     10.48.35.24                               1.60 ms                    |
+|   3     192.168.114.201                           1.62 ms                    |
++==============================================================================+
+```
+  All pre-flight checks PASSED. Proceeding to launch streams.
+
+**Pre-flight output:**
+
+```
+sudo authentication required for VRF traceroute (ip vrf exec vrf10)
+  Please enter your sudo password:
+  sudo credential cached successfully.
 
   Checking  192.168.114.200:5201  (TCP / VRF:vrf10)...
   Checking  192.168.114.201:5202  (UDP / VRF:vrf10)...
@@ -1586,6 +1623,7 @@ sudo ip vrf exec vrf10 traceroute 192.168.114.201
 +==============================================================================+
 
   All pre-flight checks PASSED. Proceeding to launch streams.
+```
 
 ## Troubleshooting
 
