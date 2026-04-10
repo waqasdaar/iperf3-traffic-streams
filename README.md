@@ -1366,12 +1366,11 @@ After all checks complete, a consolidated results table is displayed:
 | 3 10.10.114.2 5203 TCP GRT WARN 1.20/4.87/12.3 ms 33% PASS                   |
 | 4 10.10.114.99 5204 TCP vrf10 FAIL N/A 100% FAIL                             |
 +==============================================================================+
+```
 
----
+### Traceroute Path Discovery Output
 
-#### Traceroute Path Discovery Output
-
-
+```
 +==============================================================================+
 | Path Discovery — Traceroute                                                  |
 +==============================================================================+
@@ -1393,7 +1392,7 @@ After all checks complete, a consolidated results table is displayed:
 +==============================================================================+
 ```
 
-#### Failure and Warning Detail Panel
+### Failure and Warning Detail Panel
 
 When any check produces a FAIL or WARN result, a diagnostic detail panel
 is shown below the results table explaining what failed and what to check:
@@ -1411,7 +1410,7 @@ is shown below the results table explaining what failed and what to check:
 +==============================================================================+
 ```
 
-For warnings:
+### For warnings:
 
 ```
 +==============================================================================+
@@ -1424,14 +1423,12 @@ For warnings:
 +==============================================================================+
 ```
 
----
-
-#### Operator Decision Prompts
+### Operator Decision Prompts
 
 After the checks and diagnostic panels, the operator is asked how to
 proceed based on the severity of the findings.
 
-##### All Checks Pass
+### All Checks Pass
 
 All pre-flight checks PASSED. Proceeding to launch streams.
 
@@ -1454,16 +1451,16 @@ Choice [P]:
 The default is **P** (proceed) because warnings indicate degraded but
 functional connectivity. The operator may choose to proceed and observe
 the impact on stream results, or abort to investigate before the test.
+```
 
-Failures Detected
+### Failures Detected
 
+```
 2 target(s) FAILED pre-flight checks.
-
 
 Options:
 P Proceed anyway (streams may fail at runtime)
 A Abort (recommended)
-
 
 Choice [A]:
 
