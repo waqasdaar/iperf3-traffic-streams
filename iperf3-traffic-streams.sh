@@ -212,6 +212,25 @@ _PREV_DYNAMIC_LINES=0
 
 
 # =============================================================================
+# RTT & LATENCY STATE  ★ NEW IN v8.2.3 ★
+# =============================================================================
+# Parallel ping process tracking and live RTT state per client stream.
+# One background ping process runs alongside each iperf3 client stream.
+# RTT values are parsed from the ping log on every dashboard tick.
+
+declare -a PING_PIDS=()          # background ping process PIDs (one per stream)
+declare -a PING_LOGFILES=()      # ping output log files (one per stream)
+
+# Live RTT fields (updated every dashboard tick from ping log)
+declare -a S_RTT_MIN=()          # minimum RTT ms  (string, e.g. "1.234")
+declare -a S_RTT_AVG=()          # average RTT ms
+declare -a S_RTT_MAX=()          # maximum RTT ms
+declare -a S_RTT_JITTER=()       # jitter ms (mdev/stddev from ping summary)
+declare -a S_RTT_LOSS=()         # packet loss percentage string  e.g. "0%"
+declare -a S_RTT_SAMPLES=()      # number of RTT samples collected so far
+
+
+# =============================================================================
 # SECTION 9 — SPARKLINE ENGINE  ★ NEW IN v8.2.2 ★
 # =============================================================================
 #
@@ -703,6 +722,21 @@ cleanup() {
             else
                 wait "$pid" 2>/dev/null
                 tty_echo "    ${CYAN}[DONE  ]${NC}  PID $pid  $lbl  (already exited)"; (( already++ ))
+            fi
+        done
+    fi
+
+    # ★ NEW IN v8.2.3 ★ — Terminate parallel RTT ping processes
+    if (( ${#PING_PIDS[@]} > 0 )); then
+        tty_echo ""; tty_echo "${BOLD}  RTT Ping Processes:${NC}"
+        local i
+        for i in "${!PING_PIDS[@]}"; do
+            local pid="${PING_PIDS[$i]}"
+            [[ -z "$pid" || "$pid" == "0" ]] && continue
+            if kill -0 "$pid" 2>/dev/null; then
+                kill -TERM "$pid" 2>/dev/null
+                wait "$pid" 2>/dev/null
+                tty_echo "    ${GREEN}[STOP  ]${NC}  PID $pid  rtt-ping stream $((i+1))"
             fi
         done
     fi
@@ -2061,6 +2095,298 @@ show_stream_summary() {
 }
 
 # =============================================================================
+# SECTION 9b — RTT & LATENCY ENGINE  ★ NEW IN v8.2.3 ★
+# =============================================================================
+#
+# Design:
+#   For each configured client stream a continuous ping process is started
+#   in parallel immediately after the iperf3 client.  The ping sends one
+#   ICMP echo request per second (matching the dashboard refresh rate) to
+#   the same target IP, using the same VRF (when configured) and the same
+#   source bind IP (when configured).
+#
+#   The ping log is parsed on every dashboard tick to extract:
+#     - per-packet RTT (for the most recent sample)
+#     - running min / avg / max / mdev from the ping summary line
+#     - cumulative packet loss percentage
+#
+#   Platform handling:
+#     Linux  : ping -i 1 -D (timestamp) with VRF via ip vrf exec
+#     macOS  : ping -i 1 (no VRF support, GRT only)
+#
+#   VRF awareness:
+#     When a stream has S_VRF set, the ping is launched inside that VRF
+#     via "ip vrf exec <vrf> ping ..." so RTT measurements are taken on
+#     the correct network path rather than via the GRT.
+#
+#   Bind IP awareness:
+#     When S_BIND is set the ping uses "-I <bind_ip>" on Linux or
+#     "-S <bind_ip>" on macOS to source packets from the correct interface,
+#     matching the iperf3 stream's source address.
+#
+# Public API:
+#   _rtt_launch   <stream_idx>   start background ping for one stream
+#   _rtt_parse    <stream_idx>   read latest RTT values from ping log
+#   _rtt_stop     <stream_idx>   kill the ping process for one stream
+#   _rtt_display  <stream_idx>   return formatted RTT string for dashboard
+# =============================================================================
+
+# ---------------------------------------------------------------------------
+# _rtt_launch  <stream_idx>
+#
+# Starts a continuous background ping (1 packet/sec, indefinite) targeting
+# the same IP as the iperf3 stream.  The full output is written to a log
+# file that _rtt_parse reads on every tick.
+#
+# The ping is launched AFTER the iperf3 client so it does not consume any
+# connection setup time.  It runs until _rtt_stop is called or the script
+# exits via the cleanup trap.
+# ---------------------------------------------------------------------------
+_rtt_launch() {
+    local idx="$1"
+    local target="${S_TARGET[$idx]:-}"
+    local vrf="${S_VRF[$idx]:-}"
+    local bind_ip="${S_BIND[$idx]:-}"
+    local logfile="${TMPDIR}/rtt_${idx}.log"
+
+    # Initialise state arrays for this index
+    PING_LOGFILES[$idx]="$logfile"
+    S_RTT_MIN[$idx]="---"
+    S_RTT_AVG[$idx]="---"
+    S_RTT_MAX[$idx]="---"
+    S_RTT_JITTER[$idx]="---"
+    S_RTT_LOSS[$idx]="---"
+    S_RTT_SAMPLES[$idx]="0"
+
+    # Do not launch ping for loopback targets — RTT is always <0.1 ms and
+    # the values add no diagnostic value for loopback validation tests.
+    if [[ "$target" =~ ^127\. || "$target" == "::1" ]]; then
+        PING_PIDS[$idx]=0
+        return 0
+    fi
+
+    # Build the ping command appropriate for the platform and stream config
+    local ping_cmd=""
+
+    if [[ "$OS_TYPE" == "linux" ]]; then
+        # Base: continuous ping, 1 packet/sec, numeric output
+        ping_cmd="ping -i 1 -n"
+
+        # Source bind IP — forces ping to use the same interface as iperf3
+        if [[ -n "$bind_ip" && "$bind_ip" != "0.0.0.0" ]]; then
+            ping_cmd+=" -I ${bind_ip}"
+        fi
+
+        ping_cmd+=" ${target}"
+
+        # VRF: wrap the entire ping command with ip vrf exec
+        if [[ -n "$vrf" ]]; then
+            ping_cmd="ip vrf exec ${vrf} ${ping_cmd}"
+        fi
+
+    else
+        # macOS: no VRF support, -S for source address, -n numeric
+        ping_cmd="ping -i 1 -n"
+        if [[ -n "$bind_ip" && "$bind_ip" != "0.0.0.0" ]]; then
+            ping_cmd+=" -S ${bind_ip}"
+        fi
+        ping_cmd+=" ${target}"
+    fi
+
+    # Launch ping in background, capturing all output to the log file
+    eval "$ping_cmd" > "$logfile" 2>&1 &
+    PING_PIDS[$idx]=$!
+}
+
+# ---------------------------------------------------------------------------
+# _rtt_parse  <stream_idx>
+#
+# Reads the ping log for the given stream and extracts the latest RTT
+# statistics.  Called on every dashboard tick (once per second).
+#
+# Parsing strategy:
+#   1. Count total reply lines to get sample count.
+#   2. Extract the RTT from the most recent reply line for the "last" value.
+#   3. Compute running min/avg/max/jitter by scanning all reply lines
+#      accumulated so far.  This approach works correctly even when the
+#      ping process has not yet printed a summary line (which only appears
+#      after ping is killed).
+#
+# The jitter (mdev) is calculated as the mean absolute deviation of the
+# individual RTT samples from their mean — this is the same metric that
+# ping itself prints in its summary line.
+#
+# All calculations are performed in awk to avoid spawning bc or python.
+# ---------------------------------------------------------------------------
+_rtt_parse() {
+    local idx="$1"
+    local logfile="${PING_LOGFILES[$idx]:-}"
+
+    [[ -z "$logfile" || ! -f "$logfile" || ! -s "$logfile" ]] && return
+
+    # Use awk to parse all RTT data from the ping output in a single pass
+    local result
+    result=$(awk '
+    BEGIN {
+        count = 0
+        sum   = 0
+        min_v = -1
+        max_v = 0
+        loss_pct = "---"
+    }
+
+    # Match individual reply lines containing RTT.
+    # Linux format:  64 bytes from 10.0.0.1: icmp_seq=1 ttl=64 time=1.23 ms
+    # macOS format:  64 bytes from 10.0.0.1: icmp_seq=0 ttl=64 time=1.234 ms
+    /bytes from .* time=/ {
+        # Extract the time value after "time="
+        for (i = 1; i <= NF; i++) {
+            if ($i ~ /^time=/) {
+                sub(/^time=/, "", $i)
+                rtt = $i + 0
+                count++
+                sum += rtt
+                if (min_v < 0 || rtt < min_v) min_v = rtt
+                if (rtt > max_v) max_v = rtt
+                rtts[count] = rtt
+            }
+        }
+    }
+
+    # Match packet loss summary line (printed when ping is killed/ends)
+    # Linux:  3 packets transmitted, 3 received, 0% packet loss
+    # macOS:  3 packets transmitted, 3 packets received, 0.0% packet loss
+    /packet loss/ {
+        match($0, /[0-9.]+% packet loss/)
+        if (RSTART > 0) {
+            loss_pct = substr($0, RSTART, RLENGTH)
+            # Strip "packet loss" leaving just the percentage
+            sub(/ packet loss/, "", loss_pct)
+        }
+    }
+
+    END {
+        if (count == 0) {
+            print "---:---:---:---:---:0"
+            exit
+        }
+
+        avg = sum / count
+
+        # Calculate mdev (mean absolute deviation) for jitter
+        mdev_sum = 0
+        for (i = 1; i <= count; i++) {
+            diff = rtts[i] - avg
+            if (diff < 0) diff = -diff
+            mdev_sum += diff
+        }
+        mdev = (count > 0) ? mdev_sum / count : 0
+
+        # Format: min:avg:max:jitter:loss:count
+        printf "%.3f:%.3f:%.3f:%.3f:%s:%d",
+            min_v, avg, max_v, mdev,
+            (loss_pct == "---" ? "0%" : loss_pct),
+            count
+    }
+    ' "$logfile" 2>/dev/null)
+
+    [[ -z "$result" ]] && return
+
+    # Split the colon-separated result into individual fields
+    local rtt_min rtt_avg rtt_max rtt_jitter rtt_loss rtt_count
+    IFS=':' read -r rtt_min rtt_avg rtt_max rtt_jitter rtt_loss rtt_count <<< "$result"
+
+    S_RTT_MIN[$idx]="${rtt_min:-???}"
+    S_RTT_AVG[$idx]="${rtt_avg:-???}"
+    S_RTT_MAX[$idx]="${rtt_max:-???}"
+    S_RTT_JITTER[$idx]="${rtt_jitter:-???}"
+    S_RTT_LOSS[$idx]="${rtt_loss:-???}"
+    S_RTT_SAMPLES[$idx]="${rtt_count:-0}"
+}
+
+# ---------------------------------------------------------------------------
+# _rtt_stop  <stream_idx>
+#
+# Gracefully terminates the background ping process for the given stream.
+# Called from cleanup and when a stream completes normally.
+# ---------------------------------------------------------------------------
+_rtt_stop() {
+    local idx="$1"
+    local pid="${PING_PIDS[$idx]:-0}"
+    [[ "$pid" == "0" ]] && return
+    kill -TERM "$pid" 2>/dev/null
+    wait "$pid" 2>/dev/null
+    PING_PIDS[$idx]=0
+}
+
+# ---------------------------------------------------------------------------
+# _rtt_display  <stream_idx>
+#
+# Returns a formatted RTT statistics string that fits exactly within the
+# dashboard box inner width.  Called once per stream per dashboard tick.
+#
+# Fixed layout (fits within 76 printable chars at COLS=80):
+#   "  RTT  min:NNNNN  avg:NNNNN  max:NNNNN  jitter:NNNNN  loss:NNN  (NN smpl)"
+#
+# Colour coding:
+#   Green   avg < 10 ms     excellent
+#   Cyan    avg 10–50 ms    good
+#   Yellow  avg 50–150 ms   acceptable
+#   Red     avg > 150 ms    high latency / any packet loss > 0
+# ---------------------------------------------------------------------------
+_rtt_display() {
+    local idx="$1"
+    local rtt_min="${S_RTT_MIN[$idx]:-}"
+    local rtt_avg="${S_RTT_AVG[$idx]:-}"
+    local rtt_max="${S_RTT_MAX[$idx]:-}"
+    local rtt_jitter="${S_RTT_JITTER[$idx]:-}"
+    local rtt_loss="${S_RTT_LOSS[$idx]:-}"
+    local rtt_count="${S_RTT_SAMPLES[$idx]:-0}"
+
+    # No data yet — return fixed-width placeholder
+    if [[ -z "$rtt_avg" || "$rtt_avg" == "---" || "$rtt_count" == "0" ]]; then
+        printf '%s' "${DIM}  RTT  Waiting for samples...${NC}"
+        return
+    fi
+
+    # ── Colour for average RTT ────────────────────────────────────────────
+    local avg_col="$GREEN"
+    local avg_int
+    avg_int=$(printf '%.0f' "$rtt_avg" 2>/dev/null || printf '9999')
+    if   (( avg_int > 150 )); then avg_col="$RED"
+    elif (( avg_int > 50  )); then avg_col="$YELLOW"
+    elif (( avg_int > 10  )); then avg_col="$CYAN"
+    fi
+
+    # ── Colour for packet loss ────────────────────────────────────────────
+    local loss_col="$GREEN"
+    local loss_num
+    loss_num=$(printf '%s' "$rtt_loss" | tr -d '%')
+    local loss_int
+    loss_int=$(printf '%.0f' "${loss_num:-0}" 2>/dev/null || printf '0')
+    (( loss_int > 0 )) && loss_col="$RED"
+
+    # ── Format each field to a fixed visible width ────────────────────────
+    # Pad numeric strings to 7 chars (e.g. "  1.234") so columns align
+    # regardless of whether RTT is sub-1ms or 3-digit ms.
+    local f_min f_avg f_max f_jitter f_loss f_samp
+    f_min=$(printf '%7.3f' "$rtt_min"    2>/dev/null || printf '%7s' "$rtt_min")
+    f_avg=$(printf '%7.3f' "$rtt_avg"    2>/dev/null || printf '%7s' "$rtt_avg")
+    f_max=$(printf '%7.3f' "$rtt_max"    2>/dev/null || printf '%7s' "$rtt_max")
+    f_jitter=$(printf '%6.3f' "$rtt_jitter" 2>/dev/null || printf '%6s' "$rtt_jitter")
+    f_loss=$(printf '%4s' "$rtt_loss")
+    f_samp=$(printf '%4d' "$rtt_count"   2>/dev/null || printf '%4s' "$rtt_count")
+
+    printf '%s' \
+        "  ${DIM}RTT${NC}" \
+        "  ${DIM}min${NC} ${GREEN}${f_min}${NC}${DIM}ms${NC}" \
+        "  ${DIM}avg${NC} ${avg_col}${f_avg}${NC}${DIM}ms${NC}" \
+        "  ${DIM}max${NC} ${YELLOW}${f_max}${NC}${DIM}ms${NC}" \
+        "  ${DIM}jitter${NC} ${CYAN}${f_jitter}${NC}${DIM}ms${NC}" \
+        "  ${DIM}loss${NC} ${loss_col}${f_loss}${NC}" \
+        "  ${DIM}(${f_samp} smpl)${NC}"
+}
+# =============================================================================
 # SECTION 10 — COMMAND BUILDING AND LAUNCHING
 # =============================================================================
 
@@ -2164,13 +2490,19 @@ launch_servers() {
 
 launch_clients() {
     STREAM_PIDS=()
+    # ★ NEW IN v8.2.3 ★ — initialise ping tracking arrays
+    PING_PIDS=()
+    PING_LOGFILES=()
     local i
     for (( i=0; i<STREAM_COUNT; i++ )); do
         local sn=$(( i + 1 )) sf="${TMPDIR}/stream_${sn}.sh" lf="${TMPDIR}/stream_${sn}.log"
         if ! write_launch_script "$sf" "$(build_client_command "$i")"; then
             printf '%b\n' "${RED}  [ERROR] Cannot write script for stream ${sn}.${NC}"
             STREAM_PIDS+=(0); S_LOGFILE[$i]="$lf"
-            S_STATUS_CACHE[$i]="FAILED"; S_ERROR_MSG[$i]="Script creation failed"; continue
+            S_STATUS_CACHE[$i]="FAILED"; S_ERROR_MSG[$i]="Script creation failed"
+            # ★ NEW IN v8.2.3 ★ — placeholder so array indices stay aligned
+            PING_PIDS+=(0); PING_LOGFILES+=("")
+            continue
         fi
         S_SCRIPT[$i]="$sf"; S_LOGFILE[$i]="$lf"
         S_START_TS[$i]=$(date +%s); S_STATUS_CACHE[$i]="STARTING"; S_ERROR_MSG[$i]=""
@@ -2178,6 +2510,13 @@ launch_clients() {
         local pid=$!; STREAM_PIDS+=("$pid")
         printf '%b[STARTED]%b  stream %d  PID %-6d  %s -> %s:%s\n' \
             "$GREEN" "$NC" "$sn" "$pid" "${S_PROTO[$i]}" "${S_TARGET[$i]}" "${S_PORT[$i]}"
+
+        # ★ NEW IN v8.2.3 ★ — launch parallel RTT ping for this stream
+        _rtt_launch "$i"
+        if [[ "${PING_PIDS[$i]:-0}" != "0" ]]; then
+            printf '%b[PING   ]%b  stream %d  PID %-6d  rtt → %s\n' \
+                "$CYAN" "$NC" "$sn" "${PING_PIDS[$i]}" "${S_TARGET[$i]}"
+        fi
     done
 }
 
@@ -4373,38 +4712,71 @@ _render_failed_panel() {
 
 
 # ---------------------------------------------------------------------------
+# _count_server_frame_lines
+#
+# Returns the EXACT number of lines _render_server_frame will print
+# given the current SERVER_COUNT and state.
+#
+# Anatomy of _render_server_frame output:
+#   1   bline '='            top border
+#   2   bcenter              title
+#   3   bline '='            title border
+#   4   bleft                "Listeners active: N / N"
+#   5   bline '='            status border
+#   6   bleft                column header
+#   7   bline '-'            header underline
+#   per listener (SERVER_COUNT iterations):
+#     +1  printf data row
+#     +1  bline '-'  per-listener separator  (all except the last)
+#   8+N   bline '='          bottom border
+#   9+N   bleft              Ctrl+C hint
+#  10+N   bline '='          final border
+#
+# Per-listener separator is printed for every listener EXCEPT the last,
+# so separator count = SERVER_COUNT - 1  (minimum 0).
+# ---------------------------------------------------------------------------
+_count_server_frame_lines() {
+    local total=10    # 7 fixed structural lines + bottom border + hint + final border
+
+    # One data row per listener
+    (( total += SERVER_COUNT ))
+
+    # Per-listener separators (between rows, not after the last)
+    if (( SERVER_COUNT > 1 )); then
+        (( total += SERVER_COUNT - 1 ))
+    fi
+
+    printf '%d' "$total"
+}
+
+# ---------------------------------------------------------------------------
 # _count_client_frame_lines_for_state
 #
-# Calculates how many lines _render_client_frame will print given the
-# CURRENT stream states and durations.
+# Returns the EXACT number of lines _render_client_frame will print
+# given the current stream states.
 #
-# Called BEFORE rendering (to size the pre-reserve) and AFTER rendering
-# (to record the exact cursor-up distance for the next tick).
-#
-# Anatomy:
-#   1  top border          bline '='
-#   2  title               bcenter
-#   3  title border        bline '='
-#   4  counters row        bleft
-#   5  separator           print_separator
-#   6  column header       bleft
-#   +1 sub-header          bleft  (only when any stream has fixed duration)
-#   7  separator           print_separator
-#   per stream:
-#     +1  main data row    bleft
-#     +1  bar row          bleft  (only when stream has fixed dur AND not FAILED)
-#   8+N  separator         print_separator
-#   9+N  hint row          bleft
-#   10+N separator         print_separator
+# Anatomy of _render_client_frame output:
+#   1   bline '='            top border
+#   2   bcenter              title
+#   3   bline '='            title border
+#   4   bleft                counters row
+#   5   bline '='            counters border
+#   6   bleft                column header
+#   +1  bleft                progress sub-header (only when has_fixed_dur)
+#   7   bline '-'            header underline
+#   per stream (STREAM_COUNT iterations):
+#     +1  printf data row    (BW + sparkline + status)
+#     +1  bleft RTT row      (non-loopback streams only)
+#     +1  bleft progress bar (fixed-duration non-FAILED streams only)
+#     +1  bline '-'          per-stream separator (all except the last)
+#   8+N   bline '='          bottom border
+#   9+N   bleft              Ctrl+C + DSCP hint
+#  10+N   bline '='          final border
 # ---------------------------------------------------------------------------
 _count_client_frame_lines_for_state() {
-    # Base fixed lines (no streams, no sub-header):
-    #   bline'=' + bcenter + bline'=' + bleft-counters +
-    #   print_sep + bleft-col-hdr + print_sep +
-    #   print_sep + bleft-hint + print_sep = 10
-    local total=10
+    local total=10    # fixed structural lines (same anatomy as server)
 
-    # Sub-header: present when any stream has fixed duration
+    # Sub-header line — only when at least one stream has fixed duration
     local has_fixed=0
     local i
     for (( i=0; i<STREAM_COUNT; i++ )); do
@@ -4415,9 +4787,22 @@ _count_client_frame_lines_for_state() {
     # Per-stream rows
     for (( i=0; i<STREAM_COUNT; i++ )); do
         (( total++ ))   # main data row always present
+
+        # RTT row — non-loopback streams only
+        local tgt="${S_TARGET[$i]:-}"
+        if [[ ! "$tgt" =~ ^127\. && "$tgt" != "::1" ]]; then
+            (( total++ ))
+        fi
+
+        # Progress bar row — fixed-duration non-FAILED streams only
         local st="${S_STATUS_CACHE[$i]:-STARTING}"
         if (( S_DURATION[$i] > 0 )) && [[ "$st" != "FAILED" ]]; then
-            (( total++ ))   # bar row
+            (( total++ ))
+        fi
+
+        # Per-stream separator — between streams, not after the last
+        if (( i < STREAM_COUNT - 1 )); then
+            (( total++ ))
         fi
     done
 
@@ -4492,6 +4877,7 @@ _render_client_frame() {
     local i
     for (( i=0; i<STREAM_COUNT; i++ )); do probe_client_status "$i"; done
 
+    # ── Stream counters and elapsed time ─────────────────────────────────
     local nc=0 ni=0 ns=0 nd=0 nf=0
     for (( i=0; i<STREAM_COUNT; i++ )); do
         case "${S_STATUS_CACHE[$i]}" in
@@ -4503,43 +4889,62 @@ _render_client_frame() {
     local fts="${S_START_TS[0]:-0}"; (( fts == 0 )) && fts="$now"
     local efmt; efmt=$(format_seconds $(( now - fts )))
 
-    # ── Dynamic target column width ───────────────────────────────────────
-    # Row layout with sparkline (80 cols total):
-    #   " " sn(3) "  " proto(5) "  " target(W) "  " port(5) "  "
-    #   bw(11) " " spark(10) "  " time(6) "  " dscp(5) "  " status(9)
-    #   = 1+3+2+5+2+W+2+5+2+11+1+10+2+6+2+5+2+9 = 68+W
-    # Box overhead = 3  →  total = 71+W ≤ COLS(80)  →  W ≤ 9; minimum 9
-    local _tgt_col_w=9
-    for (( i=0; i<STREAM_COUNT; i++ )); do
-        local _tlen=${#S_TARGET[$i]}
-        (( _tlen > _tgt_col_w )) && _tgt_col_w=$_tlen
-    done
-    local _tgt_max=$(( COLS - 71 ))
-    (( _tgt_max < 9 )) && _tgt_max=9
-    (( _tgt_col_w > _tgt_max )) && _tgt_col_w=$_tgt_max
+    # ── Fixed column widths ───────────────────────────────────────────────
+    #
+    # Total inner width = COLS - 2 = 78 (for COLS=80)
+    #
+    # Column layout (each width includes its trailing spaces):
+    #   C_SN     =  3   stream number       e.g.  " 1 "
+    #   C_PROTO  =  5   protocol            e.g.  " TCP "
+    #   C_TARGET = 15   target IP           e.g.  " 192.168.1.100 "
+    #   C_PORT   =  6   port                e.g.  "  5201"
+    #   C_BW     = 12   bandwidth           e.g.  " 941.23 Mbps"
+    #   C_SPARK  = 12   sparkline+label     e.g.  " ·▃▄▅▆▆▇▇█▇ "
+    #   C_TIME   =  7   countdown/elapsed   e.g.  " 00:22 "
+    #   C_DSCP   =  6   DSCP name           e.g.  "   EF "
+    #   C_STATUS =  9   connection status   e.g.  "CONNECTED"
+    #
+    # Sum = 3+5+15+6+12+12+7+6+9 = 75  +  separating spaces (3) = 78 ✓
+    #
+    local C_SN=3 C_PROTO=5 C_TARGET=15 C_PORT=6
+    local C_BW=12 C_SPARK=12 C_TIME=7 C_DSCP=6 C_STATUS=9
 
     local has_fixed_dur=0
     for (( i=0; i<STREAM_COUNT; i++ )); do
         (( S_DURATION[$i] > 0 )) && has_fixed_dur=1 && break
     done
 
-    # ── Fixed frame ───────────────────────────────────────────────────────
+    # ── Top border + title ────────────────────────────────────────────────
     bline '='
     bcenter "${BOLD}${CYAN}iperf3 Traffic Streams -- Live Dashboard${NC}"
     bline '='
-    bleft "  $(printf 'Active:%-2d  Connected:%-2d  Done:%-2d  Failed:%-2d  Elapsed:%s' \
-        "$act" "$nc" "$nd" "$nf" "$efmt")"
-    print_separator
 
-    # Column header — sparkline labelled "Last 10s"  ★ NEW IN v8.2.2 ★
-    bleft "${BOLD}$(printf '%-3s  %-5s  %-*s  %-5s  %-11s %-10s  %-6s  %-5s  %-9s' \
-        '#' 'Proto' "$_tgt_col_w" 'Target' 'Port' \
-        'Bandwidth' 'Last 10s' 'Time' 'DSCP' 'Status')${NC}"
+    # ── Status summary bar ────────────────────────────────────────────────
+    bleft "$(printf \
+        '  Active:%-3d  Connected:%-3d  Done:%-3d  Failed:%-3d  Elapsed:%s' \
+        "$act" "$nc" "$nd" "$nf" "$efmt")"
+    bline '='
+
+    # ── Column header — precisely aligned to column definitions ──────────
+    bleft "${BOLD}$(printf \
+        ' %-*s  %-*s  %-*s  %*s  %-*s  %-*s  %*s  %*s  %-*s' \
+        "$C_SN"     '#' \
+        "$C_PROTO"  'Proto' \
+        "$C_TARGET" 'Target' \
+        "$C_PORT"   'Port' \
+        "$C_BW"     'Bandwidth' \
+        "$C_SPARK"  'Last 10s' \
+        "$C_TIME"   'Time' \
+        "$C_DSCP"   'DSCP' \
+        "$C_STATUS" 'Status')${NC}"
+
+    # Progress sub-header only when at least one stream has fixed duration
     if (( has_fixed_dur )); then
-        bleft "${DIM}$(printf '%-3s  %-5s  %-*s  %-5s  %-22s  %-29s' \
-            '' '' "$_tgt_col_w" '' '' '' 'Progress')${NC}"
+        local prog_indent=$(( C_SN + 2 + C_PROTO + 2 + C_TARGET + 2 + \
+                              C_PORT + 2 + C_BW + 2 + 1 ))
+        bleft "${DIM}$(printf '%*s%-s' "$prog_indent" '' 'Progress ─────────────────')${NC}"
     fi
-    print_separator
+    bline '-'
 
     # ── Per-stream rows ───────────────────────────────────────────────────
     for (( i=0; i<STREAM_COUNT; i++ )); do
@@ -4547,18 +4952,21 @@ _render_client_frame() {
         local st="${S_STATUS_CACHE[$i]:-STARTING}"
         local lf="${S_LOGFILE[$i]:-}"
 
+        # RTT parse (once per tick per stream)
+        _rtt_parse "$i"
+
+        # ── Bandwidth ─────────────────────────────────────────────────────
         local bw="---"
         [[ "$st" == "CONNECTED" ]] && bw=$(parse_live_bandwidth_from_log "$lf")
         [[ "$st" == "DONE"      ]] && bw="${S_FINAL_SENDER_BW[$i]:-N/A}"
 
-        # ── ★ NEW IN v8.2.2 ★ Push sample + render sparkline ─────────────
-        # Push only when CONNECTED with real data — not for DONE/FAILED/
-        # STARTING states, which must not pollute the history ring buffer.
+        # ── Sparkline ─────────────────────────────────────────────────────
         if [[ "$st" == "CONNECTED" && "$bw" != "---" ]]; then
             _spark_push "c" "$i" "$bw"
         fi
         local spark_str; spark_str=$(_spark_render "c" "$i")
 
+        # ── Time remaining / elapsed ──────────────────────────────────────
         local td="--:--"
         local sts="${S_START_TS[$i]:-0}"; (( sts == 0 )) && sts="$now"
         local dur="${S_DURATION[$i]:-10}"
@@ -4568,21 +4976,18 @@ _render_client_frame() {
         case "$st" in
             CONNECTED|STARTING|CONNECTING)
                 if (( dur == 0 )); then
-                    td="inf $(format_seconds "$stream_elapsed")"
+                    td="∞$(format_seconds "$stream_elapsed")"
                     show_bar=0
                 else
-                    local stream_remaining=$(( dur - stream_elapsed ))
-                    (( stream_remaining < 0 )) && stream_remaining=0
-                    td=$(format_seconds "$stream_remaining")
+                    local rem=$(( dur - stream_elapsed ))
+                    (( rem < 0 )) && rem=0
+                    td=$(format_seconds "$rem")
                     show_bar=1
                 fi
                 ;;
             DONE)
-                td="done"
-                if (( dur > 0 )); then
-                    show_bar=1
-                    stream_elapsed=$dur
-                fi
+                td="  done"
+                (( dur > 0 )) && { show_bar=1; stream_elapsed=$dur; }
                 ;;
             FAILED)
                 td="failed"
@@ -4590,13 +4995,13 @@ _render_client_frame() {
                 ;;
         esac
 
-        local dscp_display="---"
-        if [[ -n "${S_DSCP_NAME[$i]}" ]]; then
-            dscp_display="${S_DSCP_NAME[$i]}"
-        elif [[ -n "${S_DSCP_VAL[$i]}" ]] && (( S_DSCP_VAL[$i] >= 0 )); then
-            dscp_display="${S_DSCP_VAL[$i]}"
-        fi
+        # ── DSCP display ──────────────────────────────────────────────────
+        local dscp_disp="---"
+        [[ -n "${S_DSCP_NAME[$i]}" ]] && dscp_disp="${S_DSCP_NAME[$i]}"
+        [[ "$dscp_disp" == "---" && -n "${S_DSCP_VAL[$i]}" ]] && \
+            (( S_DSCP_VAL[$i] >= 0 )) && dscp_disp="${S_DSCP_VAL[$i]}"
 
+        # ── Status colour ─────────────────────────────────────────────────
         local sb sc
         case "$st" in
             CONNECTED)  sb="CONNECTED"  sc="$GREEN"  ;;
@@ -4607,33 +5012,53 @@ _render_client_frame() {
             *)          sb="$st"        sc="$NC"     ;;
         esac
 
+        # ── Target truncation to fixed column width ───────────────────────
         local tgt="${S_TARGET[$i]:-?}"
-        if (( ${#tgt} > _tgt_col_w )); then
-            tgt="${tgt:0:$(( _tgt_col_w - 1 ))}~"
+        (( ${#tgt} > C_TARGET )) && tgt="${tgt:0:$(( C_TARGET - 1 ))}~"
+
+        # ── BW truncation ─────────────────────────────────────────────────
+        local bw_disp="$bw"
+        (( ${#bw_disp} > C_BW )) && bw_disp="${bw_disp:0:$(( C_BW - 1 ))}~"
+
+        # ── Main data row — each field padded to its column width ─────────
+        printf '| '
+        printf '%-*s  '  "$C_SN"     "$sn"
+        printf '%-*s  '  "$C_PROTO"  "${S_PROTO[$i]}"
+        printf '%-*s  '  "$C_TARGET" "$tgt"
+        printf '%*s  '   "$C_PORT"   "${S_PORT[$i]}"
+        printf '%-*s  '  "$C_BW"     "$bw_disp"
+        printf '%b%-*s%b  ' "$CYAN" "$C_SPARK" "$spark_str" "$NC"
+        printf '%*s  '   "$C_TIME"   "$td"
+        printf '%*s  '   "$C_DSCP"   "$dscp_disp"
+        printf '%b%-*s%b' "$sc" "$C_STATUS" "$sb" "$NC"
+        printf ' |\033[K\n'
+
+        # ── RTT row — indented under BW column, full box width ───────────
+        local stream_tgt="${S_TARGET[$i]:-}"
+        if [[ ! "$stream_tgt" =~ ^127\. && "$stream_tgt" != "::1" ]]; then
+            local rtt_str; rtt_str=$(_rtt_display "$i")
+            bleft "$rtt_str"
         fi
 
-        # ── Main data row with inline sparkline  ★ NEW IN v8.2.2 ★ ───────
-        # Format: bw(11) space spark(10)  then time/dscp/status as before
-        local pfx
-        pfx=$(printf '%-3d  %-5s  %-*s  %-5s  %-11s ' \
-            "$sn" "${S_PROTO[$i]}" "$_tgt_col_w" "$tgt" "${S_PORT[$i]}" "$bw")
-        bleft " ${pfx}${CYAN}${spark_str}${NC}  $(printf '%-6s  %-5s  ' \
-            "$td" "$dscp_display")${sc}${sb}${NC}"
-
-        # Progress bar row (unchanged from v8.2.1.1)
+        # ── Progress bar row ──────────────────────────────────────────────
         if (( show_bar && has_fixed_dur )); then
-            local bar_str
-            bar_str=$(_render_progress_bar "$stream_elapsed" "$dur")
-            local bar_prefix
-            bar_prefix=$(printf ' %-3s  %-5s  %-*s  %-5s  %-11s ' \
-                '' '' "$_tgt_col_w" '' '' '')
-            bleft " ${bar_prefix}$(rpt ' ' 11)${bar_str}"
+            local bar_str; bar_str=$(_render_progress_bar "$stream_elapsed" "$dur")
+            # Indent the bar to start under the BW column
+            local bar_indent=$(( 1 + C_SN + 2 + C_PROTO + 2 + \
+                                 C_TARGET + 2 + C_PORT + 2 ))
+            printf '| %*s%b%s%b |\033[K\n' \
+                "$bar_indent" '' "$DIM" "$bar_str" "$NC"
+        fi
+
+        # ── Per-stream separator (thinner line between streams) ───────────
+        if (( i < STREAM_COUNT - 1 )); then
+            bline '-'
         fi
     done
 
-    print_separator
-    bleft "  ${YELLOW}Ctrl+C to stop all streams${NC}"
-    print_separator
+    bline '='
+    bleft "  ${YELLOW}Ctrl+C${NC} to stop all streams  ${DIM}|${NC}  ${CYAN}[v/p]${NC} DSCP verify"
+    bline '='
 }
 
 _render_server_frame() {
@@ -4643,52 +5068,65 @@ _render_server_frame() {
         [[ "$pid" != "0" ]] && kill -0 "$pid" 2>/dev/null && (( running++ ))
     done
 
+    # ── Fixed column widths ───────────────────────────────────────────────
+    #   C_SN     =  3   listener number
+    #   C_PORT   =  6   port
+    #   C_BIND   = 16   bind IP
+    #   C_VRF    = 10   VRF name
+    #   C_BW     = 13   bandwidth
+    #   C_SPARK  = 12   sparkline
+    #   C_STATUS =  9   status
+    # Sum = 3+6+16+10+13+12+9 = 69 + separators (6×2=12) = 81 → trim C_BIND=15
+    local C_SN=3 C_PORT=6 C_BIND=15 C_VRF=10
+    local C_BW=13 C_SPARK=12 C_STATUS=9
+
+    # ── Top border + title ────────────────────────────────────────────────
     bline '='
     bcenter "${BOLD}${CYAN}iperf3 Traffic Streams -- Server Dashboard${NC}"
     bline '='
-    bleft "  $(printf 'Listeners active: %d / %d' "$running" "$SERVER_COUNT")"
-    print_separator
+    bleft "$(printf '  Listeners active: %d / %d' "$running" "$SERVER_COUNT")"
+    bline '='
 
-    # Column header — sparkline labelled "Last 10s"  ★ NEW IN v8.2.2 ★
-    bleft "${BOLD}$(printf '%-3s  %-6s  %-16s  %-10s  %-11s %-10s  %-9s' \
-        '#' 'Port' 'Bind IP' 'VRF' 'Bandwidth' 'Last 10s' 'Status')${NC}"
-    print_separator
+    # ── Column header ─────────────────────────────────────────────────────
+    bleft "${BOLD}$(printf \
+        ' %-*s  %*s  %-*s  %-*s  %-*s  %-*s  %-*s' \
+        "$C_SN"     '#' \
+        "$C_PORT"   'Port' \
+        "$C_BIND"   'Bind IP' \
+        "$C_VRF"    'VRF' \
+        "$C_BW"     'Bandwidth' \
+        "$C_SPARK"  'Last 10s' \
+        "$C_STATUS" 'Status')${NC}"
+    bline '-'
 
+    # ── Per-listener rows ─────────────────────────────────────────────────
     for (( i=0; i<SERVER_COUNT; i++ )); do
         local sn=$(( i + 1 )) lf="${SRV_LOGFILE[$i]:-}"
         local st; st=$(probe_server_status "$i")
 
-        # ── Bandwidth display logic (unchanged from v8.2.1.1) ─────────────
+        # ── Bandwidth + cache logic (unchanged) ───────────────────────────
         local bw
         case "$st" in
             CONNECTED|RUNNING)
-                local live_bw
-                live_bw=$(parse_live_bandwidth_from_log "$lf")
+                local live_bw; live_bw=$(parse_live_bandwidth_from_log "$lf")
                 if [[ "$live_bw" != "---" && -n "$live_bw" ]]; then
-                    bw="$live_bw"
-                    SRV_BW_CACHE[$i]="$live_bw"
+                    bw="$live_bw"; SRV_BW_CACHE[$i]="$live_bw"
                 else
                     bw="${SRV_BW_CACHE[$i]:----}"
                 fi
                 ;;
-            LISTENING|STARTING)
-                bw="---"
-                SRV_BW_CACHE[$i]="---"
-                ;;
-            *)
-                bw="---"
-                ;;
+            LISTENING|STARTING) bw="---"; SRV_BW_CACHE[$i]="---" ;;
+            *)                  bw="---" ;;
         esac
 
-        # ── ★ NEW IN v8.2.2 ★ Push sample + render sparkline ─────────────
-        # Push only when a real BW sample is available (CONNECTED or RUNNING
-        # with actual data).  LISTENING/STARTING/DONE/FAILED must not push.
+        # ── Sparkline push + render ───────────────────────────────────────
         if [[ ( "$st" == "CONNECTED" || "$st" == "RUNNING" ) && \
               "$bw" != "---" && -n "$bw" ]]; then
             _spark_push "s" "$i" "$bw"
         fi
         local spark_str; spark_str=$(_spark_render "s" "$i")
 
+        # ── Status colour ─────────────────────────────────────────────────
         local sb sc
         case "$st" in
             CONNECTED) sb="CONNECTED" sc="$GREEN"  ;;
@@ -4702,26 +5140,53 @@ _render_server_frame() {
 
         local vrf_disp="${SRV_VRF[$i]:-GRT}"
         [[ "$OS_TYPE" == "macos" ]] && vrf_disp="N/A"
+        local bind_disp="${SRV_BIND[$i]:-0.0.0.0}"
 
-        # ── Main data row with inline sparkline  ★ NEW IN v8.2.2 ★ ───────
-        local pfx
-        pfx=$(printf '%-3d  %-6s  %-16s  %-10s  %-11s ' \
-            "$sn" "${SRV_PORT[$i]}" "${SRV_BIND[$i]:-0.0.0.0}" \
-            "$vrf_disp" "$bw")
-        bleft " ${pfx}${CYAN}${spark_str}${NC}  ${sc}${sb}${NC}"
+        # Truncate long bind IPs
+        (( ${#bind_disp} > C_BIND )) && \
+            bind_disp="${bind_disp:0:$(( C_BIND - 1 ))}~"
+
+        # Truncate long BW strings
+        local bw_disp="$bw"
+        (( ${#bw_disp} > C_BW )) && bw_disp="${bw_disp:0:$(( C_BW - 1 ))}~"
+
+        # ── Data row ──────────────────────────────────────────────────────
+        printf '| '
+        printf '%-*s  '  "$C_SN"     "$sn"
+        printf '%*s  '   "$C_PORT"   "${SRV_PORT[$i]}"
+        printf '%-*s  '  "$C_BIND"   "$bind_disp"
+        printf '%-*s  '  "$C_VRF"    "$vrf_disp"
+        printf '%-*s  '  "$C_BW"     "$bw_disp"
+        printf '%b%-*s%b  ' "$CYAN" "$C_SPARK" "$spark_str" "$NC"
+        printf '%b%-*s%b'   "$sc"   "$C_STATUS" "$sb" "$NC"
+        printf ' |\033[K\n'
+
+        # Per-listener separator
+        if (( i < SERVER_COUNT - 1 )); then
+            bline '-'
+        fi
     done
 
-    print_separator
-    bleft "  ${YELLOW}Ctrl+C to stop all listeners${NC}"
-    print_separator
+    bline '='
+    bleft "  ${YELLOW}Ctrl+C${NC} to stop all listeners"
+    bline '='
 }
 
+# ---------------------------------------------------------------------------
+# run_dashboard
+#
+# Main dashboard render loop.  Uses the exact line counters above to
+# pre-reserve vertical space on the first tick and to reposition the
+# cursor correctly on every subsequent tick.
+# ---------------------------------------------------------------------------
 run_dashboard() {
     local mode="${1:-client}"
     local count
     [[ "$mode" == "server" ]] && count=$SERVER_COUNT || count=$STREAM_COUNT
 
-    # Probe status BEFORE calculating pre-reserve size
+    # Probe status BEFORE calculating the pre-reserve size so the line
+    # count reflects actual current state (e.g. FAILED streams have no
+    # progress bar or RTT row).
     if [[ "$mode" != "server" ]]; then
         local j
         for (( j=0; j<STREAM_COUNT; j++ )); do
@@ -4729,10 +5194,10 @@ run_dashboard() {
         done
     fi
 
-    # Calculate exact pre-reserve size
+    # Calculate exact pre-reserve line count using the state-aware counters
     local pre_lines
     if [[ "$mode" == "server" ]]; then
-        pre_lines=$(( 10 + count ))
+        pre_lines=$(_count_server_frame_lines)
     else
         pre_lines=$(_count_client_frame_lines_for_state)
     fi
@@ -4741,15 +5206,19 @@ run_dashboard() {
     _PREV_DYNAMIC_LINES=0
     local _last_total=$pre_lines
 
+    # Print exactly pre_lines blank lines to claim vertical space, then
+    # move the cursor back to the top of the reserved block.
     local k
     for (( k=0; k<pre_lines; k++ )); do printf '\n'; done
     printf '\033[%dA' "$pre_lines"
-    printf '\033[?25l'
+    printf '\033[?25l'   # hide cursor
 
     local first_tick=1
 
     while true; do
-        # Probe (skip on tick 1 — already done before pre-reserve)
+
+        # Probe client status on every tick except the first (already done
+        # before the pre-reserve above).
         if (( first_tick == 0 )) && [[ "$mode" != "server" ]]; then
             local j
             for (( j=0; j<STREAM_COUNT; j++ )); do
@@ -4757,26 +5226,27 @@ run_dashboard() {
             done
         fi
 
-        # Move cursor to top of last rendered block
+        # Move cursor to top of the last rendered block
         if (( first_tick == 0 )); then
             printf '\033[%dA' "$_last_total"
         fi
         first_tick=0
 
-        # Render fixed frame
+        # Render the appropriate frame and measure how many lines it used
         local fixed_lines
         if [[ "$mode" == "server" ]]; then
             _render_server_frame
-            fixed_lines=$(( 10 + SERVER_COUNT ))
+            fixed_lines=$(_count_server_frame_lines)
         else
             _render_client_frame
             fixed_lines=$(_count_client_frame_lines_for_state)
         fi
 
-        # Erase from cursor to end of screen
+        # Erase from cursor to end of screen (removes stale content from
+        # frames that were taller on a previous tick)
         printf '\033[J'
 
-        # Render dynamic panels (client only)
+        # Render dynamic panels (client mode only)
         local completed_lines=0 failed_lines=0
         if [[ "$mode" != "server" ]]; then
             completed_lines=$(_count_completed_panel_lines)
@@ -4785,16 +5255,12 @@ run_dashboard() {
             (( failed_lines    > 0 )) && _render_failed_panel
         fi
 
-        # ── DSCP verification hint (client mode, when streams are CONNECTED) ──
-        # Only shown when at least one CONNECTED stream targets a non-loopback
-        # address. Loopback tests (127.x.x.x) do not benefit from tcpdump
-        # DSCP verification so the hint is suppressed entirely.
+        # DSCP verification hint (client mode — non-loopback CONNECTED streams)
         local _hint_lines=0
         if [[ "$mode" != "server" ]]; then
             local _any_verifiable=0
             local _ji
             for (( _ji=0; _ji<STREAM_COUNT; _ji++ )); do
-                # Must be CONNECTED and target must not be loopback
                 if [[ "${S_STATUS_CACHE[$_ji]}" == "CONNECTED" ]] && \
                    [[ ! "${S_TARGET[$_ji]:-}" =~ ^127\. ]] && \
                    [[ "${S_TARGET[$_ji]:-}" != "::1" ]]; then
@@ -4811,7 +5277,8 @@ run_dashboard() {
             fi
         fi
 
-        # Record total lines rendered this tick
+        # Record total lines rendered this tick so we know how far up to
+        # move the cursor on the next tick.
         local dynamic_lines=$(( completed_lines + failed_lines ))
         _last_total=$(( fixed_lines + dynamic_lines + _hint_lines ))
         _PREV_DYNAMIC_LINES=$dynamic_lines
@@ -4834,34 +5301,27 @@ run_dashboard() {
 
         (( any == 0 )) && break
 
-        # ── Non-blocking keyboard check ───────────────────────────────────
-        # Poll stdin for a keypress during the 1-second tick.
-        # Split into 10 × 0.1s checks so we respond within 0.1s.
-        # Use tr for lowercase conversion — bash 3.2 compatible.
-        local key_pressed=""
-        local key_lower=""
+        # Non-blocking keyboard check (10 × 0.1 s slices = 1 second total)
+        local key_pressed="" key_lower=""
         local tick_slice
         for (( tick_slice=0; tick_slice<10; tick_slice++ )); do
             if IFS= read -r -s -n 1 -t 0.1 key_pressed </dev/tty 2>/dev/null; then
-                # Convert to lowercase using tr — works on bash 3.2 and 4+
                 key_lower=$(printf '%s' "$key_pressed" | tr '[:upper:]' '[:lower:]')
                 break
             fi
-            key_pressed=""
-            key_lower=""
+            key_pressed=""; key_lower=""
         done
 
-        # ── Handle DSCP verification keypress (client mode only) ──────────
+        # Handle DSCP verification keypress (client mode only)
         if [[ "$mode" != "server" ]] && \
            [[ "$key_lower" == "v" || "$key_lower" == "p" ]]; then
 
-            # Restore cursor and move below the rendered content
             printf '\033[?25h'
             printf '\033[%dB' "$_last_total"
 
             _dscp_verify_interactive
 
-            # After returning, re-probe streams and recalculate frame size
+            # Re-probe and recalculate after returning from interactive mode
             local j
             for (( j=0; j<STREAM_COUNT; j++ )); do
                 probe_client_status "$j"
@@ -4871,7 +5331,6 @@ run_dashboard() {
             new_pre=$(_count_client_frame_lines_for_state)
             FRAME_LINES=$new_pre
 
-            # Re-reserve space and reposition cursor for clean redraw
             for (( k=0; k<new_pre; k++ )); do printf '\n'; done
             printf '\033[%dA' "$new_pre"
             printf '\033[?25l'
@@ -4881,7 +5340,7 @@ run_dashboard() {
         fi
     done
 
-    printf '\033[?25h'
+    printf '\033[?25h'   # restore cursor
     printf '\n'
 }
 
@@ -4955,34 +5414,134 @@ parse_final_results() {
 
 display_results_table() {
     echo ""; print_header "Final Results"; echo ""
-    printf '  %-3s  %-5s  %-16s  %-5s  %-12s  %-12s  %-20s\n' \
-        "#" "Proto" "Target" "Port" "Sender BW" "Receiver BW" "Retx / Jitter+Loss"
-    printf '  %s\n' "$(rpt '-' 80)"
+
+    # ── Fixed column widths for results table ─────────────────────────────
+    #   C_SN     =  3
+    #   C_PROTO  =  5
+    #   C_TGT    = 15
+    #   C_PORT   =  5
+    #   C_SBW    = 12   sender BW
+    #   C_RBW    = 12   receiver BW
+    #   C_EXTRA  = 20   TCP retx / UDP jitter+loss
+    #   C_RTT    = 21   RTT min/avg/max summary
+    # Separators: 7 × 2 = 14  →  total = 3+5+15+5+12+12+20+21+14 = 107
+    # At 80 cols we print to stdout (not inside the box) so full width is fine.
+    local C_SN=3 C_PROTO=5 C_TGT=15 C_PORT=5
+    local C_SBW=12 C_RBW=12 C_EXTRA=20 C_RTT=21
+
+    local sep_len=$(( C_SN+2+C_PROTO+2+C_TGT+2+C_PORT+2+C_SBW+2+C_RBW+2+C_EXTRA+2+C_RTT ))
+
+    # ── Header row ────────────────────────────────────────────────────────
+    printf '  %s\n' "$(rpt '─' "$sep_len")"
+    printf '  %-*s  %-*s  %-*s  %*s  %-*s  %-*s  %-*s  %-*s\n' \
+        "$C_SN"    '#' \
+        "$C_PROTO" 'Proto' \
+        "$C_TGT"   'Target' \
+        "$C_PORT"  'Port' \
+        "$C_SBW"   'Sender BW' \
+        "$C_RBW"   'Receiver BW' \
+        "$C_EXTRA" 'Retx / Jitter+Loss' \
+        "$C_RTT"   'RTT min/avg/max ms'
+    printf '  %s\n' "$(rpt '─' "$sep_len")"
+
     local i
     for (( i=0; i<STREAM_COUNT; i++ )); do
-        local sn=$(( i + 1 )) proto="${S_PROTO[$i]}" tgt="${S_TARGET[$i]:-?}"
-        (( ${#tgt} > 16 )) && tgt="${tgt:0:15}~"
+        local sn=$(( i + 1 ))
+        local proto="${S_PROTO[$i]}"
+        local tgt="${S_TARGET[$i]:-?}"
+        (( ${#tgt} > C_TGT )) && tgt="${tgt:0:$(( C_TGT - 1 ))}~"
+
+        # ── Failed stream row ─────────────────────────────────────────────
         if [[ "${S_STATUS_CACHE[$i]}" == "FAILED" ]]; then
             local err="${S_ERROR_MSG[$i]:-Connection failed}"
-            (( ${#err} > 36 )) && err="${err:0:33}..."
-            printf '  %-3d  %-5s  %-16s  %-5s  %b%s%b\n' \
-                "$sn" "$proto" "$tgt" "${S_PORT[$i]}" "$RED" "FAILED: $err" "$NC"
+            local err_max=$(( sep_len - C_SN - 2 - C_PROTO - 2 - C_TGT - 2 - C_PORT - 2 - 8 ))
+            (( ${#err} > err_max )) && err="${err:0:$(( err_max - 3 ))}..."
+            printf '  %b%-*s%b  %-*s  %-*s  %*s  %bFAILED: %s%b\n' \
+                "$RED"  "$C_SN"    "$sn"    "$NC" \
+                "$C_PROTO" "$proto" \
+                "$C_TGT"   "$tgt" \
+                "$C_PORT"  "${S_PORT[$i]}" \
+                "$RED" "$err" "$NC"
         else
+            # ── Normal stream row ─────────────────────────────────────────
+
+            # Extra column: retransmits (TCP) or jitter+loss (UDP)
             local extra
             [[ "$proto" == "TCP" ]] \
-                && extra="Retx:${RESULT_RTX[$i]}" \
-                || extra="J:${RESULT_JITTER[$i]} L:${RESULT_LOSS_PCT[$i]}"
-            printf '  %-3d  %-5s  %-16s  %-5s  %b%-12s%b  %b%-12s%b  %-20s\n' \
-                "$sn" "$proto" "$tgt" "${S_PORT[$i]}" \
-                "$GREEN" "${RESULT_SENDER_BW[$i]}"   "$NC" \
-                "$CYAN"  "${RESULT_RECEIVER_BW[$i]}" "$NC" "$extra"
+                && extra="Retx: ${RESULT_RTX[$i]:-0}" \
+                || extra="J:${RESULT_JITTER[$i]:-N/A} L:${RESULT_LOSS_PCT[$i]:-N/A}"
+
+            # RTT summary string: min/avg/max
+            local rtt_col="$GREEN"
+            local rtt_sum="---"
+            local rmin="${S_RTT_MIN[$i]:-}"
+            local ravg="${S_RTT_AVG[$i]:-}"
+            local rmax="${S_RTT_MAX[$i]:-}"
+            local rsamples="${S_RTT_SAMPLES[$i]:-0}"
+
+            if [[ -n "$ravg" && "$ravg" != "---" && "$rsamples" != "0" ]]; then
+                rtt_sum=$(printf '%s/%s/%s' "$rmin" "$ravg" "$rmax")
+                local avg_int
+                avg_int=$(printf '%.0f' "$ravg" 2>/dev/null || printf '9999')
+                if   (( avg_int > 150 )); then rtt_col="$RED"
+                elif (( avg_int > 50  )); then rtt_col="$YELLOW"
+                elif (( avg_int > 10  )); then rtt_col="$CYAN"
+                fi
+            fi
+
+            printf '  %-*s  %-*s  %-*s  %*s  %b%-*s%b  %b%-*s%b  %-*s  %b%-*s%b\n' \
+                "$C_SN"    "$sn" \
+                "$C_PROTO" "$proto" \
+                "$C_TGT"   "$tgt" \
+                "$C_PORT"  "${S_PORT[$i]}" \
+                "$GREEN"   "$C_SBW"   "${RESULT_SENDER_BW[$i]:-N/A}"   "$NC" \
+                "$CYAN"    "$C_RBW"   "${RESULT_RECEIVER_BW[$i]:-N/A}" "$NC" \
+                "$C_EXTRA" "$extra" \
+                "$rtt_col" "$C_RTT"   "$rtt_sum"  "$NC"
         fi
 
-        # Append MTU annotation for this stream
+        # ── MTU annotation ────────────────────────────────────────────────
         _pmtu_annotate_stream_summary "$i"
-    done
-    printf '  %s\n' "$(rpt '-' 80)"; echo ""
 
+        # ── RTT detail sub-row ────────────────────────────────────────────
+        local stream_tgt="${S_TARGET[$i]:-}"
+        if [[ ! "$stream_tgt" =~ ^127\. && "$stream_tgt" != "::1" ]]; then
+            local rmin="${S_RTT_MIN[$i]:-???}"
+            local ravg="${S_RTT_AVG[$i]:-???}"
+            local rmax="${S_RTT_MAX[$i]:-???}"
+            local rjit="${S_RTT_JITTER[$i]:-???}"
+            local rloss="${S_RTT_LOSS[$i]:-???}"
+            local rsamp="${S_RTT_SAMPLES[$i]:-0}"
+
+            if [[ "$ravg" != "---" && "$ravg" != "???" && "$rsamp" != "0" ]]; then
+                # Fixed-width detail line aligned under the main row
+                printf '  %*s  ' "$C_SN" ''
+                printf '%b' "$DIM"
+                printf '%-*s  ' "$C_PROTO" ''
+                printf '%-*s  ' "$C_TGT"   ''
+                printf '%*s  '  "$C_PORT"  ''
+                printf 'min %7.3f ms  avg %7.3f ms  max %7.3f ms  ' \
+                    "$rmin" "$ravg" "$rmax" 2>/dev/null || \
+                printf 'min %-7s ms  avg %-7s ms  max %-7s ms  ' \
+                    "$rmin" "$ravg" "$rmax"
+                printf 'jitter %6.3f ms  loss %-5s  (%d smpl)' \
+                    "$rjit" "$rloss" "$rsamp" 2>/dev/null || \
+                printf 'jitter %-6s ms  loss %-5s  (%s smpl)' \
+                    "$rjit" "$rloss" "$rsamp"
+                printf '%b\n' "$NC"
+            fi
+        fi
+
+        # ── Row separator ─────────────────────────────────────────────────
+        if (( i < STREAM_COUNT - 1 )); then
+            printf '  %s\n' "$(rpt '·' "$sep_len")"
+        fi
+    done
+
+    printf '  %s\n' "$(rpt '─' "$sep_len")"
+    echo ""
+
+    # ── Completion summary ────────────────────────────────────────────────
     local tf=0 td=0
     for (( i=0; i<STREAM_COUNT; i++ )); do
         [[ "${S_STATUS_CACHE[$i]}" == "FAILED" ]] && (( tf++ ))
@@ -4994,7 +5553,7 @@ display_results_table() {
         printf '%b  All %d stream(s) completed successfully.%b\n' "$GREEN" "$td" "$NC"
     fi
 
-    # MTU summary footer
+    # ── MTU advisory footer (unchanged) ───────────────────────────────────
     if (( BASH_MAJOR >= 4 && ${#PMTU_RESULTS[@]} > 0 )); then
         local _has_mtu_warn=0 _k
         for _k in "${!PMTU_STATUS[@]}"; do
