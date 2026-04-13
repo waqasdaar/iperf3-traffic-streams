@@ -3775,79 +3775,120 @@ _pmtu_annotate_stream_summary() {
 # Prints the interface name or empty string on failure.
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# _dscp_verify_get_iface  <stream_index>
+#
+# Resolves the correct capture interface for a stream by querying the
+# kernel routing table using the stream's TARGET IP address only.
+#
+# Logic:
+#   Loopback  →  always "lo"  (fast path, no route lookup needed)
+#
+#   Linux VRF →  ip route get vrf <vrf> <target>
+#                Queries the VRF routing table directly.
+#                Falls back to: ip vrf exec <vrf> ip route get <target>
+#                for older kernels that do not support "ip route get vrf".
+#
+#   Linux GRT →  ip route get <target>
+#                Queries the Global Routing Table.
+#
+#   macOS     →  route -n get <target>
+#                No VRF support on macOS.
+#
+# The "dev <iface>" token in the route output is the authoritative egress
+# interface — it is exactly what the kernel uses when iperf3 sends packets
+# to the target, so it is the correct interface for tcpdump capture.
+#
+# Bind IP is intentionally NOT used — the target IP route lookup always
+# returns the correct egress interface regardless of source address.
+# ---------------------------------------------------------------------------
 _dscp_verify_get_iface() {
     local idx="$1"
     local target="${S_TARGET[$idx]:-}"
     local vrf="${S_VRF[$idx]:-}"
-    local bind_ip="${S_BIND[$idx]:-}"
 
-    # ── Special case: loopback target ─────────────────────────────────────
+    # ── Fast path: loopback ───────────────────────────────────────────────
     if [[ "$target" =~ ^127\. || "$target" == "::1" ]]; then
         printf '%s' "lo"
         return 0
     fi
 
-    # ── Priority 1: resolve interface from bind IP ────────────────────────
-    # When S_BIND is set, iperf3 sends packets from that specific IP.
-    # Find the interface that owns that IP — this is the actual capture iface.
-    if [[ -n "$bind_ip" && "$bind_ip" != "0.0.0.0" ]]; then
-        local bind_iface=""
+    # ── Linux ─────────────────────────────────────────────────────────────
+    if [[ "$OS_TYPE" == "linux" ]]; then
 
-        if [[ "$OS_TYPE" == "linux" ]]; then
-            # Search all interfaces for the bind IP
-            bind_iface=$(ip -4 addr show 2>/dev/null \
-                | awk -v ip="$bind_ip" '
-                    /^[0-9]+:/ { iface = $2; gsub(/:$/, "", iface) }
-                    /inet / {
-                        split($2, a, "/")
-                        if (a[1] == ip) { print iface; exit }
-                    }')
+        local route_out="" oif=""
 
-            # If VRF is set, also try searching within the VRF context
-            if [[ -z "$bind_iface" && -n "$vrf" ]]; then
-                bind_iface=$(ip vrf exec "${vrf}" ip -4 addr show 2>/dev/null \
-                    | awk -v ip="$bind_ip" '
-                        /^[0-9]+:/ { iface = $2; gsub(/:$/, "", iface) }
-                        /inet / {
-                            split($2, a, "/")
-                            if (a[1] == ip) { print iface; exit }
-                        }')
+        # Shared awk program — extracts the interface name from the token
+        # immediately following the keyword "dev" in ip-route output.
+        # Works for all output formats:
+        #   "10.0.0.1 via 10.0.0.254 dev eth0.100 src 10.0.0.2 uid 0"
+        #   "10.0.0.1 dev eth0 src 10.0.0.2 uid 0"
+        local _awk_dev
+        _awk_dev='{ for (i=1; i<=NF; i++) if ($i=="dev" && i+1<=NF) { print $(i+1); exit } }'
+
+        if [[ -n "$vrf" ]]; then
+            # ── VRF: query the VRF routing table by target IP ─────────────
+            #
+            # Primary:  ip route get vrf <vrf> <target>
+            #   Supported on kernel >= 4.12 + iproute2 >= 4.12
+            #   Directly queries the VRF FIB without entering the VRF ns.
+            #
+            route_out=$(ip route get vrf "${vrf}" "${target}" 2>/dev/null)
+            oif=$(printf '%s' "$route_out" | awk "$_awk_dev")
+
+            if [[ -n "$oif" ]]; then
+                printf '%s' "$oif"
+                return 0
             fi
-        elif [[ "$OS_TYPE" == "macos" ]]; then
-            bind_iface=$(ifconfig 2>/dev/null \
-                | awk -v ip="$bind_ip" '
-                    /^[a-z]/ { iface = $1; gsub(/:$/, "", iface) }
-                    /inet / {
-                        if ($2 == ip) { print iface; exit }
-                    }')
-        fi
 
-        if [[ -n "$bind_iface" ]]; then
-            printf '%s' "$bind_iface"
-            return 0
-        fi
+            # Fallback: ip vrf exec <vrf> ip route get <target>
+            #   Works on older kernels that do not support "ip route get vrf".
+            #   Enters the VRF network namespace context and runs the lookup.
+            #
+            route_out=$(ip vrf exec "${vrf}" ip route get "${target}" 2>/dev/null)
+            oif=$(printf '%s' "$route_out" | awk "$_awk_dev")
 
-        # bind_ip set but interface not found — fall through to route lookup
-        # and warn in the caller
+            if [[ -n "$oif" ]]; then
+                printf '%s' "$oif"
+                return 0
+            fi
+
+            # Both VRF lookups failed
+            printf '%s' ""
+            return 1
+
+        else
+            # ── GRT: query the Global Routing Table by target IP ──────────
+            #
+            route_out=$(ip route get "${target}" 2>/dev/null)
+            oif=$(printf '%s' "$route_out" | awk "$_awk_dev")
+
+            if [[ -n "$oif" ]]; then
+                printf '%s' "$oif"
+                return 0
+            fi
+
+            # GRT lookup failed
+            printf '%s' ""
+            return 1
+        fi
     fi
 
-    # ── Priority 2: route lookup for target ───────────────────────────────
-    if [[ "$OS_TYPE" == "linux" ]]; then
-        local oif=""
-        if [[ -n "$vrf" ]]; then
-            oif=$(ip vrf exec "${vrf}" ip route get "${target}" \
-                2>/dev/null | grep -oE '\bdev [^ ]+' | awk '{print $2}' | head -1)
-        else
-            oif=$(ip route get "${target}" \
-                2>/dev/null | grep -oE '\bdev [^ ]+' | awk '{print $2}' | head -1)
-        fi
-        printf '%s' "${oif:-}"
-    elif [[ "$OS_TYPE" == "macos" ]]; then
+    # ── macOS ─────────────────────────────────────────────────────────────
+    if [[ "$OS_TYPE" == "macos" ]]; then
         local oif=""
         oif=$(route -n get "${target}" 2>/dev/null \
-            | grep -E 'interface:' | awk '{print $2}' | head -1)
-        printf '%s' "${oif:-}"
+            | awk '/interface:/ { print $2; exit }')
+        if [[ -n "$oif" ]]; then
+            printf '%s' "$oif"
+            return 0
+        fi
+        printf '%s' ""
+        return 1
     fi
+
+    printf '%s' ""
+    return 1
 }
 
 # ---------------------------------------------------------------------------
@@ -3974,12 +4015,10 @@ _dscp_verify_run() {
     bleft "  Interface: ${BOLD}${iface}${NC}"
 
     # ── Determine interface resolution method for display ─────────────────
-    if [[ -n "$bind_ip" && "$bind_ip" != "0.0.0.0" ]]; then
-        bleft "  ${DIM}Interface resolved from bind IP ${bind_ip}${NC}"
-    elif [[ -n "$vrf" ]]; then
-        bleft "  ${DIM}Interface resolved via VRF ${vrf} route to ${target}${NC}"
+    if [[ -n "$vrf" ]]; then
+        bleft "  ${DIM}Interface resolved via: ip route get vrf ${vrf} ${target}${NC}"
     else
-        bleft "  ${DIM}Interface resolved via GRT route to ${target}${NC}"
+        bleft "  ${DIM}Interface resolved via: ip route get ${target}${NC}"
     fi
 
     bleft "  ${DIM}Capturing up to 50 packets (3 second window)...${NC}"
