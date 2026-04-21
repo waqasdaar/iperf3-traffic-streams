@@ -843,6 +843,49 @@ _spark_render() {
         }'
 }
 
+
+# ---------------------------------------------------------------------------
+# _extract_bw_from_line  <line>
+#
+# Extracts the bandwidth value and unit from a single iperf3 interval line.
+# Handles all known iperf3 output formats:
+#
+#   Standard:   [  5]  0.00-1.00  sec  112 MBytes   940 Mbits/sec
+#   TCP bidir:  [  5][TX-C]  0.00-1.00  sec  131 KBytes  1.07 Mbits/sec  0  90.5 KBytes
+#   UDP:        [  5]  0.00-1.00  sec  128 KBytes  1.05 Mbits/sec  0.022 ms  0/128
+#
+# Strategy: scan all fields for a unit token ending in "bits/sec".
+# The field immediately before it is the numeric value.
+# This is position-independent and handles any number of extra fields.
+#
+# Returns normalised bandwidth string e.g. "1.07 Mbps" or "" on failure.
+# ---------------------------------------------------------------------------
+_extract_bw_from_line() {
+    local line="$1"
+    [[ -z "$line" ]] && { printf '%s' ''; return; }
+
+    local result
+    result=$(printf '%s\n' "$line" | awk '
+    {
+        for (i = 1; i <= NF; i++) {
+            # Match unit tokens: bits/sec, Kbits/sec, Mbits/sec, Gbits/sec
+            # Also accept lowercase variants and the common typo "bit/sec"
+            if ($i ~ /^[KMGkmg]?bits?\/(sec|s)$/) {
+                if (i > 1 && $(i-1) ~ /^[0-9]+(\.[0-9]+)?$/) {
+                    print $(i-1) " " $i
+                    exit
+                }
+            }
+        }
+    }')
+
+    if [[ -n "$result" ]]; then
+        _normalise_text_bw "$result"
+    else
+        printf '%s' ''
+    fi
+}
+
 # =============================================================================
 # SECTION 1 — PRIMITIVES
 # =============================================================================
@@ -1205,17 +1248,9 @@ _parse_bidir_bw_from_log() {
     [[ -z "$ll" ]] && { printf '%s' '---'; return; }
 
     local result
-    result=$(printf '%s\n' "$ll" | awk '
-    {
-        for (i = 1; i <= NF; i++) {
-            if ($i ~ /^[KMGkmg]?bits\/sec$/) {
-                if (i > 1) { print $(i-1) " " $i; exit }
-            }
-        }
-    }')
-
-    if [[ -n "$result" ]]; then
-        _normalise_text_bw "$result"
+    result=$(_extract_bw_from_line "$ll")
+    if [[ -n "$result" && "$result" != "---" ]]; then
+        printf '%s' "$result"
     else
         printf '%s' '---'
     fi
@@ -1340,17 +1375,9 @@ _parse_srv_live_bw() {
     # The awk scans all fields for a unit token matching bits/sec variants
     # and returns the preceding numeric field paired with the unit.
     local result
-    result=$(printf '%s\n' "$ll" | awk '
-    {
-        for (i = 1; i <= NF; i++) {
-            if ($i ~ /^[KMGkmg]?bits\/sec$/) {
-                if (i > 1) { print $(i-1) " " $i; exit }
-            }
-        }
-    }')
-
-    if [[ -n "$result" ]]; then
-        _normalise_text_bw "$result"
+    result=$(_extract_bw_from_line "$ll")
+    if [[ -n "$result" && "$result" != "---" ]]; then
+        printf '%s' "$result"
     else
         printf '%s' '---'
     fi
@@ -8414,7 +8441,7 @@ main_menu() {
     while true; do
         show_main_menu
         local choice
-        read -r -p "  Select [1-6]: " choice </dev/tty
+        read -r -p "  Select [1-7]: " choice </dev/tty
         case "$choice" in
             1)
                 echo ""; build_vrf_maps; get_interface_list
@@ -8477,7 +8504,7 @@ main_menu() {
                 S_RTT_MIN=();   S_RTT_AVG=();  S_RTT_MAX=()
                 S_RTT_JITTER=(); S_RTT_LOSS=(); S_RTT_SAMPLES=()
                 ;;
-5)
+            5)
                 echo ""; show_dscp_table
                 read -r -p "  Press Enter to return to menu..." </dev/tty ;;
             6)
