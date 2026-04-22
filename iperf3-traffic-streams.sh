@@ -7911,54 +7911,52 @@ run_dashboard() {
         else
             _render_client_frame
 
-            # ── Calculate line count AFTER rendering ───────────────────────
-            # Compute directly without a subshell to avoid any set -e
-            # interference from subshell process state.
-            #
-            # This mirrors _count_client_frame_lines_for_state exactly,
-            # then adds CWND inline rows that were actually rendered.
-            local _fc_total=11  # fixed structural lines + notification banner
+            # ── Calculate line count inline — no subshell, no set -e risk ──
+            # Replicate _count_client_frame_lines_for_state logic directly
+            # plus CWND inline rows, using $(( )) expansion throughout
+            # so exit codes are always 0 regardless of expression value.
+            local _fc=11
             local _fci
             for (( _fci=0; _fci<STREAM_COUNT; _fci++ )); do
                 local _fcst="${S_STATUS_CACHE[$_fci]:-STARTING}"
 
                 if [[ "$_fcst" == "CLEANED" || "$_fcst" == "CLEANUP_PENDING" ]]; then
-                    _fc_total=$(( _fc_total + 1 ))
+                    _fc=$(( _fc + 1 ))
                     if (( _fci < STREAM_COUNT - 1 )); then
-                        _fc_total=$(( _fc_total + 1 ))
+                        _fc=$(( _fc + 1 ))
                     fi
                     continue
                 fi
 
-                _fc_total=$(( _fc_total + 1 ))  # TX row
+                _fc=$(( _fc + 1 ))   # TX row
 
                 if [[ "${S_BIDIR[$_fci]:-0}" == "1" ]]; then
-                    _fc_total=$(( _fc_total + 1 ))  # RX row
+                    _fc=$(( _fc + 1 ))   # RX row
                 fi
 
                 local _fctgt="${S_TARGET[$_fci]:-}"
                 if [[ ! "$_fctgt" =~ ^127\. && "$_fctgt" != "::1" ]]; then
-                    _fc_total=$(( _fc_total + 1 ))  # RTT row
+                    _fc=$(( _fc + 1 ))   # RTT row
                 fi
 
-                # CWND inline row — only when samples exist
                 if [[ "${S_PROTO[$_fci]:-TCP}" == "TCP" ]] && \
                    [[ ! "$_fctgt" =~ ^127\. && "$_fctgt" != "::1" ]] && \
                    [[ "${S_CWND_SAMPLES[$_fci]:-0}" != "0" ]]; then
-                    _fc_total=$(( _fc_total + 1 ))  # CWND inline row
+                    _fc=$(( _fc + 1 ))   # CWND inline row
                 fi
 
-                if (( S_DURATION[$_fci] > 0 )) && [[ "$_fcst" != "FAILED" ]]; then
-                    _fc_total=$(( _fc_total + 1 ))  # progress bar row
+                if (( S_DURATION[$_fci] > 0 )) && \
+                   [[ "$_fcst" != "FAILED" ]]; then
+                    _fc=$(( _fc + 1 ))   # progress bar row
                 fi
 
                 if (( _fci < STREAM_COUNT - 1 )); then
-                    _fc_total=$(( _fc_total + 1 ))  # per-stream separator
+                    _fc=$(( _fc + 1 ))   # per-stream separator
                 fi
             done
 
-            fixed_lines=$_fc_total
-            _LAST_FRAME_LINE_COUNT=$fixed_lines
+            fixed_lines=$_fc
+            _LAST_FRAME_LINE_COUNT=$_fc
         fi
 
         # ── Erase stale content below the current frame ───────────────────
