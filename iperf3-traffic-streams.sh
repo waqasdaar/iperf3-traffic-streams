@@ -7305,10 +7305,11 @@ _render_progress_bar() {
 _render_client_frame() {
 
     # ── Disable errexit for the entire render function ────────────────────
-    # set -e triggers on (( expr )) when expr==0, and on other commands
-    # that return non-zero in normal operation. The render function is
-    # purely presentational and must never exit early due to a non-zero
-    # return code from any sub-expression.
+    # set -e triggers on (( expr )) when expr evaluates to 0 (false), and
+    # on other commands that return non-zero in normal operation.
+    # The render function is purely presentational — it must never exit
+    # early due to a non-zero return code from any sub-expression.
+    # We save the current errexit state and restore it at the end.
     local _old_errexit=0
     [[ $- == *e* ]] && _old_errexit=1
     set +e
@@ -7330,21 +7331,21 @@ _render_client_frame() {
         esac
     done
 
-    # ── Counters ───────────────────────────────────────────────────────────
+    # ── Stream counters ────────────────────────────────────────────────────
     local nc=0 ni=0 ns=0 nd=0 nf=0 n_cleaned=0
     for (( i=0; i<STREAM_COUNT; i++ )); do
         case "${S_STATUS_CACHE[$i]}" in
-            CONNECTED)               (( nc++       )) ;;
-            CONNECTING)              (( ni++       )) ;;
-            STARTING)                (( ns++       )) ;;
-            DONE)                    (( nd++       )) ;;
-            FAILED)                  (( nf++       )) ;;
+            CONNECTED)               (( nc++        )) ;;
+            CONNECTING)              (( ni++        )) ;;
+            STARTING)                (( ns++        )) ;;
+            DONE)                    (( nd++        )) ;;
+            FAILED)                  (( nf++        )) ;;
             CLEANED|CLEANUP_PENDING) (( n_cleaned++ )) ;;
         esac
     done
     local act=$(( nc + ni + ns ))
     local fts="${S_START_TS[0]:-0}"
-    (( fts == 0 )) && fts="$now"
+    if (( fts == 0 )); then fts="$now"; fi
     local efmt; efmt=$(format_seconds $(( now - fts )))
 
     # ── Column widths ──────────────────────────────────────────────────────
@@ -7355,7 +7356,10 @@ _render_client_frame() {
 
     local has_fixed_dur=0
     for (( i=0; i<STREAM_COUNT; i++ )); do
-        (( S_DURATION[$i] > 0 )) && { has_fixed_dur=1; break; }
+        if (( S_DURATION[$i] > 0 )); then
+            has_fixed_dur=1
+            break
+        fi
     done
 
     # ── Header ────────────────────────────────────────────────────────────
@@ -7381,7 +7385,9 @@ _render_client_frame() {
         # ── CLEANED / CLEANUP_PENDING tombstone ───────────────────────────
         if [[ "$st" == "CLEANED" || "$st" == "CLEANUP_PENDING" ]]; then
             local tgt_c="${S_TARGET[$i]:-?}"
-            (( ${#tgt_c} > C_TARGET )) && tgt_c="${tgt_c:0:$(( C_TARGET-1 ))}~"
+            if (( ${#tgt_c} > C_TARGET )); then
+                tgt_c="${tgt_c:0:$(( C_TARGET-1 ))}~"
+            fi
             if [[ "$st" == "CLEANUP_PENDING" ]]; then
                 local plain_pending
                 plain_pending=$(printf \
@@ -7412,19 +7418,20 @@ _render_client_frame() {
                         | tail -1 \
                         | awk '{
                             for (i=1;i<=NF;i++) {
-                                if ($i=="bits/sec"||$i=="Kbits/sec"||$i=="kbits/sec"||
-                                    $i=="Mbits/sec"||$i=="mbits/sec"||
-                                    $i=="Gbits/sec"||$i=="gbits/sec") {
+                                if ($i=="bits/sec"  ||
+                                    $i=="Kbits/sec" || $i=="kbits/sec" ||
+                                    $i=="Mbits/sec" || $i=="mbits/sec" ||
+                                    $i=="Gbits/sec" || $i=="gbits/sec") {
                                     if (i>1 && $(i-1)+0>0) {
                                         val=$(i-1)+0; unit=$i
                                         if (unit~/[Gg]/) bps=val*1e9
                                         else if (unit~/[Mm]/) bps=val*1e6
                                         else if (unit~/[Kk]/) bps=val*1e3
                                         else bps=val
-                                        if (bps>=1e9) printf "%.2f Gbps",bps/1e9
+                                        if      (bps>=1e9) printf "%.2f Gbps",bps/1e9
                                         else if (bps>=1e6) printf "%.2f Mbps",bps/1e6
                                         else if (bps>=1e3) printf "%.2f Kbps",bps/1e3
-                                        else printf "%.0f bps",bps
+                                        else               printf "%.0f bps",bps
                                         exit
                                     }
                                 }
@@ -7439,19 +7446,20 @@ _render_client_frame() {
                         | tail -1 \
                         | awk '{
                             for (i=1;i<=NF;i++) {
-                                if ($i=="bits/sec"||$i=="Kbits/sec"||$i=="kbits/sec"||
-                                    $i=="Mbits/sec"||$i=="mbits/sec"||
-                                    $i=="Gbits/sec"||$i=="gbits/sec") {
+                                if ($i=="bits/sec"  ||
+                                    $i=="Kbits/sec" || $i=="kbits/sec" ||
+                                    $i=="Mbits/sec" || $i=="mbits/sec" ||
+                                    $i=="Gbits/sec" || $i=="gbits/sec") {
                                     if (i>1 && $(i-1)+0>0) {
                                         val=$(i-1)+0; unit=$i
                                         if (unit~/[Gg]/) bps=val*1e9
                                         else if (unit~/[Mm]/) bps=val*1e6
                                         else if (unit~/[Kk]/) bps=val*1e3
                                         else bps=val
-                                        if (bps>=1e9) printf "%.2f Gbps",bps/1e9
+                                        if      (bps>=1e9) printf "%.2f Gbps",bps/1e9
                                         else if (bps>=1e6) printf "%.2f Mbps",bps/1e6
                                         else if (bps>=1e3) printf "%.2f Kbps",bps/1e3
-                                        else printf "%.0f bps",bps
+                                        else               printf "%.0f bps",bps
                                         exit
                                     }
                                 }
@@ -7465,7 +7473,7 @@ _render_client_frame() {
         fi
         [[ "$st" == "DONE" ]] && bw_tx="${S_FINAL_SENDER_BW[$i]:-N/A}"
 
-        # ── RX bandwidth ──────────────────────────────────────────────────
+        # ── RX bandwidth (bidir only) ─────────────────────────────────────
         local bw_rx="${S_BIDIR_BW[$i]:-???}"
         local spark_rx=""
         if [[ "${S_BIDIR[$i]:-0}" == "1" ]]; then
@@ -7564,8 +7572,9 @@ _render_client_frame() {
                 case "$st" in
                     CONNECTED|CONNECTING|STARTING)
                         if [[ -f "$rx_lf" && -s "$rx_lf" ]]; then
-                            if grep -qE '\]\[RX-C\].*[0-9.]+-[0-9.]+|\]\[RX\].*[0-9.]+-[0-9.]+|^\[RX-C\].*[0-9.]+-[0-9.]+' \
-                                    "$rx_lf" 2>/dev/null; then
+                            if grep -qE \
+                                '\]\[RX-C\].*[0-9.]+-[0-9.]+|\]\[RX\].*[0-9.]+-[0-9.]+|^\[RX-C\].*[0-9.]+-[0-9.]+' \
+                                "$rx_lf" 2>/dev/null; then
                                 rx_st="CONNECTED"
                             else
                                 rx_st="CONNECTING"
@@ -7593,7 +7602,7 @@ _render_client_frame() {
             bleft "${CYAN}↓ RX${NC} ${plain_rx}${rx_sc}$(printf '%-*s' "$C_STAT" "$rx_st")${NC}"
         fi
 
-        # ── RTT row ───────────────────────────────────────────────────────
+        # ── RTT row (non-loopback streams only) ───────────────────────────
         local stream_tgt="${S_TARGET[$i]:-}"
         if [[ ! "$stream_tgt" =~ ^127\. && "$stream_tgt" != "::1" ]]; then
             local rtt_str; rtt_str=$(_rtt_display "$i")
@@ -7612,26 +7621,30 @@ _render_client_frame() {
             IFS='|' read -r _ phase_name_inline _ <<< "$phase_inline"
 
             local ci_col="$GREEN"
-            local ci_int; ci_int=$(printf '%.0f' "$cwnd_inline_cur" 2>/dev/null || printf '0')
+            local ci_int
+            ci_int=$(printf '%.0f' "$cwnd_inline_cur" 2>/dev/null || printf '0')
             if   (( ci_int < 10  )); then ci_col="$RED"
             elif (( ci_int < 50  )); then ci_col="$YELLOW"
             elif (( ci_int < 200 )); then ci_col="$CYAN"
             fi
 
-            local f_ci_cur; f_ci_cur=$(printf '%.0f' "$cwnd_inline_cur" 2>/dev/null || printf '%s' "$cwnd_inline_cur")
-            local f_ci_max; f_ci_max=$(printf '%.0f' "$cwnd_inline_max"  2>/dev/null || printf '%s' "$cwnd_inline_max")
+            local f_ci_cur f_ci_max
+            f_ci_cur=$(printf '%.0f' "$cwnd_inline_cur" 2>/dev/null \
+                || printf '%s' "$cwnd_inline_cur")
+            f_ci_max=$(printf '%.0f' "$cwnd_inline_max"  2>/dev/null \
+                || printf '%s' "$cwnd_inline_max")
 
             bleft "  ${DIM}cwnd${NC}  ${ci_col}${BOLD}${f_ci_cur}${NC}${DIM}KB${NC}  ${DIM}max${NC} ${f_ci_max}${DIM}KB${NC}  ${cwnd_inline_spark}  ${DIM}[${phase_name_inline}]${NC}"
         fi
 
-        # ── Progress bar row ──────────────────────────────────────────────
+        # ── Progress bar row (fixed-duration non-FAILED streams only) ─────
         if (( show_bar == 1 )) && (( has_fixed_dur == 1 )); then
             local bar_str; bar_str=$(_render_progress_bar "$stream_elapsed" "$dur")
             local bar_indent=$(( C_SN + 1 + C_PROTO + 1 + C_TARGET + 1 + C_PORT + 1 ))
             bleft "$(printf '%*s' "$bar_indent" '')${bar_str}"
         fi
 
-        # ── Per-stream separator ──────────────────────────────────────────
+        # ── Per-stream separator (between streams, not after last) ────────
         if (( i < STREAM_COUNT - 1 )); then
             bline '-'
         fi
@@ -7647,6 +7660,8 @@ _render_client_frame() {
     bline '='
 
     # ── Notification banner (always exactly 1 line) ───────────────────────
+    # Always prints exactly one line — blank when no notification,
+    # highlighted when a cleanup event has been logged.
     local _notify_msg
     _notify_msg="$(_assoc_get G_LAST_NOTIFY 0 2>/dev/null)"
     if [[ -n "$_notify_msg" ]]; then
@@ -7661,28 +7676,16 @@ _render_client_frame() {
         printf '\033[K\n'
     fi
 
-    # ── Restore errexit if it was active before entering this function ────
+    # ── Restore errexit state ─────────────────────────────────────────────
+    # Must happen BEFORE returning so the caller's set -e state is intact.
     if (( _old_errexit == 1 )); then set -e; fi
 
-    # ── Calculate line count based on what was rendered ───────────────────
-    # Uses _count_client_frame_lines_for_state (accurate state-based model)
-    # plus CWND inline rows that were rendered this tick.
-    # This replaces the _rc counter which was vulnerable to set -e exits.
-    local _base_lines
-    _base_lines=$(_count_client_frame_lines_for_state)
-
-    local _ci _cwnd_extra=0
-    for (( _ci=0; _ci<STREAM_COUNT; _ci++ )); do
-        local _cst="${S_STATUS_CACHE[$_ci]:-}"
-        case "$_cst" in CLEANED|CLEANUP_PENDING|FAILED) continue ;; esac
-        if [[ "${S_PROTO[$_ci]:-TCP}" != "TCP" ]]; then continue; fi
-        local _ctgt="${S_TARGET[$_ci]:-}"
-        if [[ "$_ctgt" =~ ^127\. || "$_ctgt" == "::1" ]]; then continue; fi
-        if [[ "${S_CWND_SAMPLES[$_ci]:-0}" == "0" ]]; then continue; fi
-        _cwnd_extra=$(( _cwnd_extra + 1 ))
-    done
-
-    _LAST_FRAME_LINE_COUNT=$(( _base_lines + _cwnd_extra ))
+    # ── _LAST_FRAME_LINE_COUNT is NOT set here ────────────────────────────
+    # run_dashboard calculates the line count after calling this function
+    # using _count_client_frame_lines_for_state + CWND extra rows.
+    # Keeping the count calculation outside this function eliminates the
+    # risk of the subshell call to _count_client_frame_lines_for_state
+    # being affected by a transitional set -e / set +e state.
 }
 
 _render_server_frame() {
@@ -7904,7 +7907,32 @@ run_dashboard() {
             fixed_lines=$(_count_server_frame_lines)
         else
             _render_client_frame
-            fixed_lines=$_LAST_FRAME_LINE_COUNT
+
+            # ── Calculate line count AFTER rendering ───────────────────────
+            # _count_client_frame_lines_for_state returns the base count
+            # (all rows except CWND inline which is excluded from
+            # pre-reservation). We add CWND inline rows that were actually
+            # rendered this tick by checking which streams have cwnd data.
+            #
+            # This calculation runs in the main shell context (not inside
+            # _render_client_frame) so it is never affected by the
+            # set +e / set -e toggle inside the render function.
+            local _base_fc
+            _base_fc=$(_count_client_frame_lines_for_state)
+
+            local _cwnd_fc=0 _fci
+            for (( _fci=0; _fci<STREAM_COUNT; _fci++ )); do
+                local _fcst="${S_STATUS_CACHE[$_fci]:-}"
+                case "$_fcst" in CLEANED|CLEANUP_PENDING|FAILED) continue ;; esac
+                [[ "${S_PROTO[$_fci]:-TCP}" != "TCP" ]] && continue
+                local _fctgt="${S_TARGET[$_fci]:-}"
+                [[ "$_fctgt" =~ ^127\. || "$_fctgt" == "::1" ]] && continue
+                [[ "${S_CWND_SAMPLES[$_fci]:-0}" == "0" ]] && continue
+                _cwnd_fc=$(( _cwnd_fc + 1 ))
+            done
+
+            fixed_lines=$(( _base_fc + _cwnd_fc ))
+            _LAST_FRAME_LINE_COUNT=$fixed_lines
         fi
 
         # ── Erase stale content below the current frame ───────────────────
