@@ -563,7 +563,7 @@ SELECTED_IP=""
 SELECTED_VRF=""
 BIDIR_SUPPORTED=0
 _PREV_DYNAMIC_LINES=0
-_LAST_FRAME_LINE_COUNT=0   # set by _render_client_frame after each render
+_LAST_FRAME_LINE_COUNT=0   # set by run_dashboard after each render
 
 # =============================================================================
 # COLOUR THEME ENGINE
@@ -7048,10 +7048,13 @@ _count_cwnd_panel_lines() {
 
     # Anatomy:
     #   3  fixed header  (top border + bcenter + title border)
-    #   5  per stream    (identity + phase + sep + stats + sep)
+    #   4  per stream    (identity + phase + sep + stats)
+    #             Note: NO trailing separator per stream —
+    #             _render_cwnd_reference_table starts with +---+
+    #             which acts as the visual separator after stats
     #   12 reference table (sep + header + sep + 6 rows +
     #                       sep + legend + bottom border)
-    printf '%d' $(( 3 + tcp_count * 5 + 12 ))
+    printf '%d' $(( 3 + tcp_count * 4 + 12 ))
 }
 
 _render_completed_panel() {
