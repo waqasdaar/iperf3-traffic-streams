@@ -202,8 +202,8 @@ sudo dnf install -y iperf3 iproute gawk grep coreutils ethtool
 ```
 **Build iperf3 from source (for latest version)**
 ```
-git clone https://github.com/waqasdaar/prism.git
-cd prism
+git clone https://github.com/esnet/iperf.git
+cd iperf
 ./configure
 make
 sudo make install
