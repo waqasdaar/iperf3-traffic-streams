@@ -3620,22 +3620,25 @@ _render_cwnd_reference_table() {
 _render_cwnd_panel() {
     local inner=$(( COLS - 2 ))
 
-    # ── Check if any TCP streams have cwnd data ────────────────────────────
-    local has_tcp_cwnd=0
+    # ── Check if any TCP non-loopback streams are active ──────────────────
+    local has_tcp_active=0
     local i
     for (( i=0; i<STREAM_COUNT; i++ )); do
         local st="${S_STATUS_CACHE[$i]:-}"
-        case "$st" in CONNECTED|DONE|CLEANED) ;; *) continue ;; esac
+        case "$st" in
+            CONNECTED|DONE|CLEANED|CLEANUP_PENDING) ;;
+            *) continue ;;
+        esac
         [[ "${S_PROTO[$i]:-TCP}" != "TCP" ]] && continue
-        [[ "${S_CWND_SAMPLES[$i]:-0}" == "0" ]] && continue
-        has_tcp_cwnd=1
+        local tgt="${S_TARGET[$i]:-}"
+        [[ "$tgt" =~ ^127\. || "$tgt" == "::1" ]] && continue
+        has_tcp_active=1
         break
     done
 
-    (( has_tcp_cwnd == 0 )) && return
+    (( has_tcp_active == 0 )) && return
 
     # ── Panel header ───────────────────────────────────────────────────────
-    # 3 fixed header lines counted by _count_cwnd_panel_lines
     printf '+%s+\033[K\n' "$(rpt '=' $inner)"
     bcenter "${BOLD}${CYAN}TCP Congestion Window — Live Tracking${NC}"
     printf '+%s+\033[K\n' "$(rpt '=' $inner)"
@@ -3645,24 +3648,22 @@ _render_cwnd_panel() {
     #   1  stream identity line
     #   1  phase line
     #   1  separator (+---+)
-    #   1  statistics row
-    # No trailing separator — _render_cwnd_reference_table starts with
-    # +---+ which acts as the visual separator after the last stream.
-    # Total per stream: 4
+    #   1  statistics row (or "Waiting..." placeholder)
     for (( i=0; i<STREAM_COUNT; i++ )); do
         local st="${S_STATUS_CACHE[$i]:-}"
-        case "$st" in CONNECTED|DONE|CLEANED) ;; *) continue ;; esac
+        case "$st" in
+            CONNECTED|DONE|CLEANED|CLEANUP_PENDING) ;;
+            *) continue ;;
+        esac
         [[ "${S_PROTO[$i]:-TCP}" != "TCP" ]] && continue
-        [[ "${S_CWND_SAMPLES[$i]:-0}" == "0" ]] && continue
+        local stream_tgt="${S_TARGET[$i]:-}"
+        [[ "$stream_tgt" =~ ^127\. || "$stream_tgt" == "::1" ]] && continue
 
         local sn=$(( i + 1 ))
         local tgt="${S_TARGET[$i]:-?}"
         local port="${S_PORT[$i]:-?}"
-        local cwnd_cur="${S_CWND_CURRENT[$i]:-0}"
-        local cwnd_min="${S_CWND_MIN[$i]:-0}"
-        local cwnd_max="${S_CWND_MAX[$i]:-0}"
-        local cwnd_final="${S_CWND_FINAL[$i]:-0}"
-        local cwnd_hist="${S_CWND_HISTORY[$i]:-}"
+        local has_data=0
+        [[ "${S_CWND_SAMPLES[$i]:-0}" != "0" ]] && has_data=1
 
         # ── Line 1: stream identity ────────────────────────────────────────
         local stream_line="Stream ${sn}   ${tgt}:${port}   ${S_DSCP_NAME[$i]:+DSCP: ${S_DSCP_NAME[$i]}}"
@@ -3673,84 +3674,92 @@ _render_cwnd_panel() {
             "${BOLD}" "$stream_line" "${NC}" "$(rpt ' ' $srp)"
 
         # ── Line 2: phase line ─────────────────────────────────────────────
-        local phase_raw
-        phase_raw=$(_cwnd_detect_phase "$i")
-        local phase_code phase_name phase_desc
-        IFS='|' read -r phase_code phase_name phase_desc <<< "$phase_raw"
+        if (( has_data == 1 )); then
+            local phase_raw
+            phase_raw=$(_cwnd_detect_phase "$i")
+            local phase_code phase_name phase_desc
+            IFS='|' read -r phase_code phase_name phase_desc <<< "$phase_raw"
 
-        local phase_col
-        case "$phase_code" in
-            SLOW_START)    phase_col="$GREEN"  ;;
-            CONG_AVOID)    phase_col="$CYAN"   ;;
-            FAST_RECOVERY) phase_col="$YELLOW" ;;
-            TIMEOUT)       phase_col="$RED"    ;;
-            SSTHRESH)      phase_col="$YELLOW" ;;
-            STEADY)        phase_col="$GREEN"  ;;
-            *)             phase_col="$DIM"    ;;
-        esac
+            local phase_col
+            case "$phase_code" in
+                SLOW_START)    phase_col="$GREEN"  ;;
+                CONG_AVOID)    phase_col="$CYAN"   ;;
+                FAST_RECOVERY) phase_col="$YELLOW" ;;
+                TIMEOUT)       phase_col="$RED"    ;;
+                SSTHRESH)      phase_col="$YELLOW" ;;
+                STEADY)        phase_col="$GREEN"  ;;
+                *)             phase_col="$DIM"    ;;
+            esac
 
-        local p_plain_len=$(( ${#phase_name} + ${#phase_desc} + 9 ))
-        local prp=$(( inner - 2 - p_plain_len - 1 ))
-        (( prp < 0 )) && prp=0
-        printf '|  %b' "$phase_col"
-        printf 'Phase: %s%b   %b%s%b%s|\033[K\n' \
-            "$phase_name" "$NC" \
-            "$DIM" "$phase_desc" "$NC" \
-            "$(rpt ' ' $prp)"
+            local p_plain_len=$(( ${#phase_name} + ${#phase_desc} + 9 ))
+            local prp=$(( inner - 2 - p_plain_len - 1 ))
+            (( prp < 0 )) && prp=0
+            printf '|  %b' "$phase_col"
+            printf 'Phase: %s%b   %b%s%b%s|\033[K\n' \
+                "$phase_name" "$NC" \
+                "$DIM" "$phase_desc" "$NC" \
+                "$(rpt ' ' $prp)"
+        else
+            # Placeholder phase line while waiting for data
+            local wait_line="Phase: ---   Waiting for TCP interval data..."
+            local wlen=${#wait_line}
+            local wrp=$(( inner - 2 - wlen - 1 ))
+            (( wrp < 0 )) && wrp=0
+            printf '|  %b%s%b%s|\033[K\n' \
+                "$DIM" "$wait_line" "$NC" "$(rpt ' ' $wrp)"
+        fi
 
         # ── Line 3: separator ─────────────────────────────────────────────
         printf '+%s+\033[K\n' "$(rpt '-' $inner)"
 
-        # ── Line 4: statistics row ─────────────────────────────────────────
-        local f_cur f_min f_max f_final f_avg_raw
-        f_cur=$(printf '%.1f' "$cwnd_cur"         2>/dev/null \
-            || printf '%s' "$cwnd_cur")
-        f_min=$(printf '%.1f' "$cwnd_min"         2>/dev/null \
-            || printf '%s' "$cwnd_min")
-        f_max=$(printf '%.1f' "$cwnd_max"         2>/dev/null \
-            || printf '%s' "$cwnd_max")
-        f_final=$(printf '%.1f' "${cwnd_final:-0}" 2>/dev/null \
-            || printf '%s' "${cwnd_final:-N/A}")
+        # ── Line 4: statistics row (or placeholder) ────────────────────────
+        if (( has_data == 1 )); then
+            local cwnd_cur="${S_CWND_CURRENT[$i]:-0}"
+            local cwnd_min="${S_CWND_MIN[$i]:-0}"
+            local cwnd_max="${S_CWND_MAX[$i]:-0}"
+            local cwnd_final="${S_CWND_FINAL[$i]:-0}"
+            local cwnd_hist="${S_CWND_HISTORY[$i]:-}"
 
-        f_avg_raw=$(printf '%s\n' "${cwnd_hist:-0}" | awk -F: '
-            { s=0; for(i=1;i<=NF;i++) s+=$i+0; printf "%.1f", s/NF }')
+            local f_cur f_min f_max f_final f_avg_raw
+            f_cur=$(printf '%.1f' "$cwnd_cur"          2>/dev/null || printf '%s' "$cwnd_cur")
+            f_min=$(printf '%.1f' "$cwnd_min"          2>/dev/null || printf '%s' "$cwnd_min")
+            f_max=$(printf '%.1f' "$cwnd_max"          2>/dev/null || printf '%s' "$cwnd_max")
+            f_final=$(printf '%.1f' "${cwnd_final:-0}"  2>/dev/null || printf '%s' "${cwnd_final:-N/A}")
+            f_avg_raw=$(printf '%s\n' "${cwnd_hist:-0}" | awk -F: '
+                { s=0; for(i=1;i<=NF;i++) s+=$i+0; printf "%.1f", s/NF }')
 
-        local c_col="$GREEN"
-        local c_int
-        c_int=$(printf '%.0f' "$cwnd_cur" 2>/dev/null || printf '0')
-        if   (( c_int < 10  )); then c_col="$RED"
-        elif (( c_int < 50  )); then c_col="$YELLOW"
-        elif (( c_int < 200 )); then c_col="$CYAN"
+            local c_col="$GREEN"
+            local c_int; c_int=$(printf '%.0f' "$cwnd_cur" 2>/dev/null || printf '0')
+            if   (( c_int < 10  )); then c_col="$RED"
+            elif (( c_int < 50  )); then c_col="$YELLOW"
+            elif (( c_int < 200 )); then c_col="$CYAN"
+            fi
+
+            local stat_plain
+            stat_plain="  Current: ${f_cur} KB    Min: ${f_min} KB    Max: ${f_max} KB    Avg: ${f_avg_raw} KB    Final: ${f_final} KB"
+            local sprp=$(( inner - ${#stat_plain} - 1 ))
+            (( sprp < 0 )) && sprp=0
+
+            printf '|  '
+            printf '%bCurrent:%b %b%s%b KB    ' "$DIM" "$NC" "$c_col"    "$f_cur"     "$NC"
+            printf '%bMin:%b %b%s%b KB    '     "$DIM" "$NC" "$CYAN"     "$f_min"     "$NC"
+            printf '%bMax:%b %b%s%b KB    '     "$DIM" "$NC" "$YELLOW"   "$f_max"     "$NC"
+            printf '%bAvg:%b %b%s%b KB    '     "$DIM" "$NC" "$NC"       "$f_avg_raw" "$NC"
+            printf '%bFinal:%b %b%s%b KB'       "$DIM" "$NC" "$c_col"    "$f_final"   "$NC"
+            printf '%s|\033[K\n' "$(rpt ' ' $sprp)"
+        else
+            # Placeholder stats row — same width as real stats row
+            local wait_stats="  Waiting for congestion window data from iperf3..."
+            local wslen=${#wait_stats}
+            local wsrp=$(( inner - wslen - 1 ))
+            (( wsrp < 0 )) && wsrp=0
+            printf '|%b%s%b%s|\033[K\n' \
+                "$DIM" "$wait_stats" "$NC" "$(rpt ' ' $wsrp)"
         fi
-
-        local stat_plain
-        stat_plain="  Current: ${f_cur} KB    Min: ${f_min} KB    Max: ${f_max} KB    Avg: ${f_avg_raw} KB    Final: ${f_final} KB"
-        local sprp=$(( inner - ${#stat_plain} - 1 ))
-        (( sprp < 0 )) && sprp=0
-
-        printf '|  '
-        printf '%bCurrent:%b %b%s%b KB    ' "$DIM" "$NC" "$c_col"    "$f_cur"     "$NC"
-        printf '%bMin:%b %b%s%b KB    '     "$DIM" "$NC" "$CYAN"     "$f_min"     "$NC"
-        printf '%bMax:%b %b%s%b KB    '     "$DIM" "$NC" "$YELLOW"   "$f_max"     "$NC"
-        printf '%bAvg:%b %b%s%b KB    '     "$DIM" "$NC" "$NC"       "$f_avg_raw" "$NC"
-        printf '%bFinal:%b %b%s%b KB'       "$DIM" "$NC" "$c_col"    "$f_final"   "$NC"
-        printf '%s|\033[K\n' "$(rpt ' ' $sprp)"
-
-        # No trailing +---+ separator here.
-        # _render_cwnd_reference_table opens with +---+ which serves
-        # as the separator between the last stream's stats and the table.
 
     done
 
     # ── Reference table ────────────────────────────────────────────────────
-    # Prints exactly 12 lines:
-    #   1  +---+ separator  (also acts as post-stats separator)
-    #   1  header row
-    #   1  +---+ separator
-    #   6  data rows
-    #   1  +---+ separator
-    #   1  legend line
-    #   1  +===+ bottom border
     _render_cwnd_reference_table "$inner"
 }
 
@@ -7039,9 +7048,16 @@ _count_cwnd_panel_lines() {
     local tcp_count=0 i
     for (( i=0; i<STREAM_COUNT; i++ )); do
         local st="${S_STATUS_CACHE[$i]:-}"
-        case "$st" in CONNECTED|DONE|CLEANED) ;; *) continue ;; esac
+        # Include CONNECTED streams even without samples yet —
+        # the panel renders a placeholder, keeping the line count stable
+        case "$st" in
+            CONNECTED|DONE|CLEANED) ;;
+            CLEANUP_PENDING) ;;
+            *) continue ;;
+        esac
         [[ "${S_PROTO[$i]:-TCP}" != "TCP" ]] && continue
-        [[ "${S_CWND_SAMPLES[$i]:-0}" == "0" ]] && continue
+        local tgt="${S_TARGET[$i]:-}"
+        [[ "$tgt" =~ ^127\. || "$tgt" == "::1" ]] && continue
         (( tcp_count++ ))
     done
     (( tcp_count == 0 )) && { printf '%d' 0; return; }
@@ -7049,11 +7065,7 @@ _count_cwnd_panel_lines() {
     # Anatomy:
     #   3  fixed header  (top border + bcenter + title border)
     #   4  per stream    (identity + phase + sep + stats)
-    #             Note: NO trailing separator per stream —
-    #             _render_cwnd_reference_table starts with +---+
-    #             which acts as the visual separator after stats
-    #   12 reference table (sep + header + sep + 6 rows +
-    #                       sep + legend + bottom border)
+    #   12 reference table
     printf '%d' $(( 3 + tcp_count * 4 + 12 ))
 }
 
@@ -7976,7 +7988,11 @@ run_dashboard() {
             (( cwnd_lines      > 0 )) && _render_cwnd_panel
         fi
 
-        # ── DSCP verify hint ────────────────────────────────────────────
+        # ── DSCP verify hint ──────────────────────────────────────────────
+        # Always print exactly 3 lines for non-loopback client mode.
+        # Keeping _hint_lines=3 constant from tick 1 eliminates the
+        # transition-tick anchor drift caused by _hint_lines going 0→3
+        # when the stream first becomes CONNECTED.
         local _hint_lines=0
         if [[ "$mode" != "server" ]] && ! _all_streams_loopback; then
             local _any_verifiable=0
@@ -7989,17 +8005,16 @@ run_dashboard() {
                     break
                 fi
             done
-            # Always print exactly 3 lines for the hint area.
-            # When no CONNECTED stream exists, print blank lines.
-            # This keeps _hint_lines=3 constant and prevents the
-            # anchor drift caused by _hint_lines transitioning 0→3.
+            # Line 1: blank
             printf '\033[K\n'
+            # Line 2: hint text or blank
             if (( _any_verifiable == 1 )); then
                 printf '  %b[v/p]%b  Verify DSCP marking for a stream\033[K\n' \
                     "$DIM" "$NC"
             else
                 printf '\033[K\n'
             fi
+            # Line 3: blank
             printf '\033[K\n'
             _hint_lines=3
         fi
