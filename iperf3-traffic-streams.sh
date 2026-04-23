@@ -7976,7 +7976,7 @@ run_dashboard() {
             (( cwnd_lines      > 0 )) && _render_cwnd_panel
         fi
 
-        # ── DSCP verify hint ───────────────────────────────────────────────
+        # ── DSCP verify hint ────────────────────────────────────────────
         local _hint_lines=0
         if [[ "$mode" != "server" ]] && ! _all_streams_loopback; then
             local _any_verifiable=0
@@ -7989,13 +7989,19 @@ run_dashboard() {
                     break
                 fi
             done
+            # Always print exactly 3 lines for the hint area.
+            # When no CONNECTED stream exists, print blank lines.
+            # This keeps _hint_lines=3 constant and prevents the
+            # anchor drift caused by _hint_lines transitioning 0→3.
+            printf '\033[K\n'
             if (( _any_verifiable == 1 )); then
-                printf '\033[K\n'
                 printf '  %b[v/p]%b  Verify DSCP marking for a stream\033[K\n' \
                     "$DIM" "$NC"
+            else
                 printf '\033[K\n'
-                _hint_lines=3
             fi
+            printf '\033[K\n'
+            _hint_lines=3
         fi
 
         # ── Record total lines and re-anchor cursor position ──────────────
