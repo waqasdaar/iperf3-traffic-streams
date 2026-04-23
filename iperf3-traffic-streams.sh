@@ -560,6 +560,9 @@ declare -a MTP_DURATIONS=()  # per-class durations
 declare -a MTP_BINDS=()      # per-class bind IPs
 declare -a MTP_VRFS=()       # per-class VRFs
 
+MTP_BASE_PORT=5201
+MTP_PORT_MODE="auto"
+
 STREAM_COUNT=0
 SERVER_COUNT=0
 FRAME_LINES=0
@@ -8571,10 +8574,10 @@ _mtp_show_presets() {
     local C1=3 C2=22 C3=$(( inner - 3 - 3 - 22 - 2 - 2 ))
     (( C3 < 20 )) && C3=20
 
-    bleft "${BOLD}$(printf '%-*s  %-*s  %-*s' $C1 '#' $C2 'Preset Name' $C3 'Mix Description')${NC}"
+    bleft "${BOLD}$(printf '%-*s  %-*s  %-*s' \
+        $C1 '#' $C2 'Preset Name' $C3 'Mix Description')${NC}"
     printf '+%s+\n' "$(rpt '-' $inner)"
 
-    # Preset data: NUM|NAME|DESCRIPTION
     local -a presets=(
         "1|Enterprise WAN|70% TCP Bulk (AF11)  +  20% UDP RTP (EF)  +  10% UDP Low (CS1)"
         "2|Data Centre|60% TCP Bulk (AF21)  +  30% TCP iSCSI (AF31)  +  10% ICMP/Mgmt (CS2)"
@@ -8596,10 +8599,20 @@ _mtp_show_presets() {
         printf '|  %s%s|\n' "$row" "$(rpt ' ' $rp)"
     done
 
+    # Separator before the back option so it is visually distinct
+    printf '+%s+\n' "$(rpt '-' $inner)"
+
+    local back_row
+    printf -v back_row '%-*s  %-*s  %-*s' \
+        $C1 "7" $C2 "Back to Main Menu" $C3 "Return without launching any streams"
+    local brlen=${#back_row}
+    local brp=$(( inner - 2 - brlen - 1 ))
+    (( brp < 0 )) && brp=0
+    printf '|  %b%s%b%s|\n' "$DIM" "$back_row" "$NC" "$(rpt ' ' $brp)"
+
     printf '+%s+\n' "$(rpt '=' $inner)"
     echo ""
 }
-
 # ---------------------------------------------------------------------------
 # _mtp_select_preset  <out_array_name>
 #
@@ -8715,21 +8728,119 @@ _mtp_define_custom_mix() {
         done
         total_pct=$(( total_pct + pct ))
 
-        # DSCP
-        printf "  DSCP marking (e.g. EF, AF41, CS1, or Enter for none): "
-        local dscp_raw
-        read -r dscp_raw </dev/tty
-        dscp_raw="${dscp_raw:-}"
+        # ── DSCP marking ──────────────────────────────────────────────────
+        # Show the full DSCP reference table immediately so the operator
+        # can see all available values before making a selection.
+        # The table is re-printed whenever the operator types 'list'.
+        # The loop continues until a valid DSCP name/value is entered
+        # or Enter is pressed to select none (best-effort).
+
+        echo ""
+        printf '%b  -- DSCP Marking --%b\n' "$CYAN" "$NC"
+        echo ""
+
+        # Print the DSCP table inline (same data as show_dscp_table
+        # but without the full box header so it fits the wizard flow)
+        printf '  %-12s  %-4s  %-4s  %-44s\n' \
+            "Name" "DSCP" "TOS" "Typical Use Case"
+        printf '  %s  %s  %s  %s\n' \
+            "$(rpt '-' 12)" "$(rpt '-' 4)" "$(rpt '-' 4)" "$(rpt '-' 44)"
+
+        local -a _dscp_rows=(
+            "Default/CS0:0:0:Best Effort — no QoS marking"
+            "CS1:8:32:Scavenger / Low-priority bulk"
+            "AF11:10:40:Low data (assured, low drop)"
+            "AF12:12:48:Low data (assured, med drop)"
+            "AF13:14:56:Low data (assured, high drop)"
+            "CS2:16:64:OAM / Network management"
+            "AF21:18:72:High-throughput data (low drop)"
+            "AF22:20:80:High-throughput data (med drop)"
+            "AF23:22:88:High-throughput data (high drop)"
+            "CS3:24:96:Broadcast video / Signalling"
+            "AF31:26:104:Multimedia streaming (low drop)"
+            "AF32:28:112:Multimedia streaming (med drop)"
+            "AF33:30:120:Multimedia streaming (high drop)"
+            "CS4:32:128:Real-time interactive"
+            "AF41:34:136:Multimedia conf (low drop)"
+            "AF42:36:144:Multimedia conf (med drop)"
+            "AF43:38:152:Multimedia conf (high drop)"
+            "CS5:40:160:Signalling / Call control"
+            "VA:44:176:Voice Admit (CAC admitted)"
+            "EF:46:184:Expedited Forwarding — VoIP"
+            "CS6:48:192:Network Control (BGP/OSPF)"
+            "CS7:56:224:Reserved / Network Critical"
+        )
+
+        local _dr
+        for _dr in "${_dscp_rows[@]}"; do
+            local _dn _dv _dt _du
+            IFS=':' read -r _dn _dv _dt _du <<< "$_dr"
+            printf '  %-12s  %-4s  %-4s  %-44s\n' \
+                "$_dn" "$_dv" "$_dt" "$_du"
+        done
+
+        printf '  %s  %s  %s  %s\n' \
+            "$(rpt '-' 12)" "$(rpt '-' 4)" "$(rpt '-' 4)" "$(rpt '-' 44)"
+        echo ""
+        printf '  %b TOS = DSCP × 4  |  Enter name (e.g. EF, AF41), 0-63,' \
+            "$DIM"
+        printf ' "list" to reprint, or Enter for none%b\n\n' "$NC"
+
         local dscp_name=""
-        if [[ -n "$dscp_raw" ]]; then
-            local dscp_val
-            dscp_val=$(dscp_name_to_value "$dscp_raw")
-            if [[ "$dscp_val" != "-1" ]]; then
-                dscp_name=$(printf '%s' "$dscp_raw" | tr '[:lower:]' '[:upper:]')
-            else
-                printf '%b  Invalid DSCP — using none.%b\n' "$YELLOW" "$NC"
+        while true; do
+            read -r -p \
+                "  DSCP marking for Class ${class_num} (name/0-63/list/Enter=none): " \
+                dscp_raw </dev/tty
+            dscp_raw="${dscp_raw:-}"
+
+            # Empty input → best-effort, no DSCP
+            if [[ -z "$dscp_raw" ]]; then
+                dscp_name=""
+                printf '%b  No DSCP marking applied (best-effort).%b\n' \
+                    "$DIM" "$NC"
+                break
             fi
-        fi
+
+            # 'list' → reprint the table and re-prompt
+            local _dscp_lower
+            _dscp_lower=$(printf '%s' "$dscp_raw" | tr '[:upper:]' '[:lower:]')
+            if [[ "$_dscp_lower" == "list" ]]; then
+                echo ""
+                printf '  %-12s  %-4s  %-4s  %-44s\n' \
+                    "Name" "DSCP" "TOS" "Typical Use Case"
+                printf '  %s  %s  %s  %s\n' \
+                    "$(rpt '-' 12)" "$(rpt '-' 4)" "$(rpt '-' 4)" \
+                    "$(rpt '-' 44)"
+                for _dr in "${_dscp_rows[@]}"; do
+                    local _dn _dv _dt _du
+                    IFS=':' read -r _dn _dv _dt _du <<< "$_dr"
+                    printf '  %-12s  %-4s  %-4s  %-44s\n' \
+                        "$_dn" "$_dv" "$_dt" "$_du"
+                done
+                printf '  %s  %s  %s  %s\n' \
+                    "$(rpt '-' 12)" "$(rpt '-' 4)" "$(rpt '-' 4)" \
+                    "$(rpt '-' 44)"
+                echo ""
+                continue
+            fi
+
+            # Validate via dscp_name_to_value
+            local _dscp_val
+            _dscp_val=$(dscp_name_to_value "$dscp_raw")
+            if [[ "$_dscp_val" == "-1" ]]; then
+                printf '%b  Invalid DSCP "%s". Enter a name from the table,' \
+                    "$RED" "$dscp_raw"
+                printf ' a value 0-63, "list", or press Enter for none.%b\n' \
+                    "$NC"
+                continue
+            fi
+
+            dscp_name=$(printf '%s' "$dscp_raw" | tr '[:lower:]' '[:upper:]')
+            printf '%b  DSCP set to: %b%s%b (value: %s  TOS: %s)%b\n' \
+                "$GREEN" "$BOLD" "$dscp_name" "$NC" \
+                "$_dscp_val" "$(( _dscp_val * 4 ))" "$NC"
+            break
+        done
 
         # Per-stream bandwidth (UDP requires it, TCP optional)
         local bw_per_stream=""
@@ -8794,7 +8905,28 @@ _mtp_define_custom_mix() {
 # Stores results in MTP_TARGETS and MTP_PORTS parallel arrays.
 # ---------------------------------------------------------------------------
 # ---------------------------------------------------------------------------
-# _mtp_configure_targets  (updated)
+# _mtp_configure_targets
+#
+# Collects target IPs, duration, bind interface, and port configuration
+# for each traffic class.
+#
+# Port configuration offers three modes:
+#
+#   1. Auto sequential   — operator sets a single base port; each class
+#                          starts immediately after the previous class's
+#                          last port. No manual port entry required.
+#
+#   2. Custom per-class  — operator enters a specific base port for each
+#                          class. Within a class, streams increment from
+#                          that base. Operator can reuse the previous
+#                          class's base or change it.
+#
+#   3. Single port all   — all streams across all classes use the same
+#                          port. Useful when the server uses a single
+#                          listener that handles all traffic types.
+#
+# The selected mode and base port are stored in MTP_BASE_PORT and
+# MTP_PORT_MODE for use in _mtp_calculate_streams.
 # ---------------------------------------------------------------------------
 _mtp_configure_targets() {
     local inner=$(( COLS - 2 ))
@@ -8803,6 +8935,8 @@ _mtp_configure_targets() {
     MTP_DURATIONS=()
     MTP_BINDS=()
     MTP_VRFS=()
+    MTP_BASE_PORT=5201
+    MTP_PORT_MODE="auto"   # auto | custom | single
 
     printf '+%s+\n' "$(rpt '=' $inner)"
     bcenter "${BOLD}${CYAN}Configure Targets for Each Traffic Class${NC}"
@@ -8821,17 +8955,90 @@ _mtp_configure_targets() {
     local dur_val=0
     [[ "$duration" != "0" ]] && dur_val=$(( 10#$duration ))
 
-    # ── Global bind IP — full interface-selection wizard ───────────────────
+    # ── Port configuration mode ────────────────────────────────────────────
     echo ""
+    printf '+%s+\n' "$(rpt '-' $inner)"
+    bcenter "${BOLD}Port Configuration${NC}"
+    printf '+%s+\n' "$(rpt '-' $inner)"
+    bleft "  Choose how ports are assigned across traffic classes."
+    printf '+%s+\n' "$(rpt '-' $inner)"
+
+    # Display the three options as a small table
+    local PC_NUM=3 PC_NAME=22 PC_DESC=$(( inner - 3 - 3 - 22 - 2 - 2 ))
+    (( PC_DESC < 20 )) && PC_DESC=20
+
+    bleft "${BOLD}$(printf '%-*s  %-*s  %-*s' \
+        $PC_NUM '#' $PC_NAME 'Mode' $PC_DESC 'Description')${NC}"
+    printf '+%s+\n' "$(rpt '-' $inner)"
+
+    _port_mode_row() {
+        local num="$1" name="$2" desc="$3"
+        local row
+        printf -v row '%-*s  %-*s  %-*s' \
+            $PC_NUM "$num" $PC_NAME "$name" $PC_DESC "$desc"
+        local rlen=${#row}
+        local rp=$(( inner - 2 - rlen - 1 ))
+        (( rp < 0 )) && rp=0
+        printf '|  %s%s|\n' "$row" "$(rpt ' ' $rp)"
+    }
+
+    _port_mode_row "1" "Auto Sequential" \
+        "Set one base port — classes increment automatically (no overlap)"
+    _port_mode_row "2" "Custom Per-Class" \
+        "Specify a different base port for each traffic class manually"
+    _port_mode_row "3" "Single Port All" \
+        "All streams use the same port (single server listener)"
+    printf '+%s+\n' "$(rpt '=' $inner)"
+    echo ""
+
+    local port_mode_choice
+    while true; do
+        read -r -p "  Select port mode [1]: " port_mode_choice </dev/tty
+        port_mode_choice="${port_mode_choice:-1}"
+        [[ "$port_mode_choice" =~ ^[1-3]$ ]] && break
+        printf '%b  Enter 1, 2, or 3.%b\n' "$RED" "$NC"
+    done
+
+    case "$port_mode_choice" in
+        1) MTP_PORT_MODE="auto"   ;;
+        2) MTP_PORT_MODE="custom" ;;
+        3) MTP_PORT_MODE="single" ;;
+    esac
+
+    # ── Base / single port prompt (modes 1 and 3) ──────────────────────────
+    if [[ "$MTP_PORT_MODE" == "auto" || \
+          "$MTP_PORT_MODE" == "single" ]]; then
+        local mode_label
+        [[ "$MTP_PORT_MODE" == "auto"   ]] && \
+            mode_label="Starting base port (classes auto-increment from here)"
+        [[ "$MTP_PORT_MODE" == "single" ]] && \
+            mode_label="Single port used by all streams"
+
+        echo ""
+        while true; do
+            printf "  %s [5201]: " "$mode_label"
+            local bp
+            read -r bp </dev/tty
+            bp="${bp:-5201}"
+            validate_port "$bp" && {
+                MTP_BASE_PORT=$(( 10#$bp ))
+                break
+            }
+            printf '%b  Invalid port. Enter 1-65535.%b\n' "$RED" "$NC"
+        done
+    fi
+
+    echo ""
+
+    # ── Global bind IP — full interface-selection wizard ───────────────────
     printf '+%s+\n' "$(rpt '-' $inner)"
     bcenter "${BOLD}Source Bind Interface / IP${NC}"
     printf '+%s+\n' "$(rpt '-' $inner)"
     bleft "  Select a source interface for all streams, enter an IP directly,"
-    bleft "  type ${BOLD}list${NC} to refresh the table, or ${BOLD}0${NC} / Enter for auto (no bind)."
+    bleft "  type ${BOLD}list${NC} to refresh the table, or ${BOLD}0${NC} / Enter for auto."
     printf '+%s+\n' "$(rpt '-' $inner)"
     echo ""
 
-    # Refresh interface list and display the table
     get_interface_list
     show_interface_table
     echo ""
@@ -8847,7 +9054,7 @@ _mtp_configure_targets() {
             _bind_raw </dev/tty
         _bind_raw="${_bind_raw:-}"
 
-        # ── Enter / 0 → auto ──────────────────────────────────────────────
+        # Enter / 0 → auto
         if [[ -z "$_bind_raw" || "$_bind_raw" == "0" ]]; then
             global_bind=""
             global_vrf=""
@@ -8857,7 +9064,7 @@ _mtp_configure_targets() {
             break
         fi
 
-        # ── 'list' → refresh table ─────────────────────────────────────────
+        # 'list' → refresh
         local _bind_lower
         _bind_lower=$(printf '%s' "$_bind_raw" | tr '[:upper:]' '[:lower:]')
         if [[ "$_bind_lower" == "list" ]]; then
@@ -8868,7 +9075,7 @@ _mtp_configure_targets() {
             continue
         fi
 
-        # ── Numeric → select interface by table row ────────────────────────
+        # Numeric → select by table row
         if [[ "$_bind_raw" =~ ^[0-9]+$ ]]; then
             local _sel_num=$(( 10#$_bind_raw ))
             local _total_ifaces=${#IFACE_NAMES[@]}
@@ -8891,10 +9098,9 @@ _mtp_configure_targets() {
                 continue
             fi
 
-            if [[ "$_sel_state" != "up" ]]; then
+            [[ "$_sel_state" != "up" ]] && \
                 printf '%b  WARNING: %s state="%s". Proceeding.%b\n' \
                     "$YELLOW" "$_sel_iface" "$_sel_state" "$NC"
-            fi
 
             printf '%b  Bound to: %s → %s%b\n' \
                 "$GREEN" "$_sel_iface" "$_sel_ip" "$NC"
@@ -8911,11 +9117,9 @@ _mtp_configure_targets() {
                     bind_from_grt=0
                     printf '%b  Auto-detected VRF: %s%b\n' \
                         "$GREEN" "$global_vrf" "$NC"
-
-                    # Allow operator to override the auto-detected VRF
                     local vrf_override
                     read -r -p \
-                        "  VRF [${global_vrf}] (Enter to confirm, or type new): " \
+                        "  VRF [${global_vrf}] (Enter to confirm): " \
                         vrf_override </dev/tty
                     vrf_override="${vrf_override:-$global_vrf}"
                     if [[ -z "$vrf_override" ]]; then
@@ -8933,14 +9137,12 @@ _mtp_configure_targets() {
             break
         fi
 
-        # ── Direct IP entry ────────────────────────────────────────────────
+        # Direct IP entry
         if validate_ip "$_bind_raw"; then
             global_bind="$_bind_raw"
             printf '%b  Bind IP set to: %s%b\n' "$GREEN" "$global_bind" "$NC"
 
-            # For Linux: prompt for VRF when a raw IP is entered directly
             if [[ "$OS_TYPE" == "linux" ]]; then
-                # Try to auto-detect VRF from the entered IP
                 local _auto_vrf=""
                 local _ki
                 for (( _ki=0; _ki<${#IFACE_IPS[@]}; _ki++ )); do
@@ -8965,7 +9167,8 @@ _mtp_configure_targets() {
                         "  VRF [${global_vrf}] (Enter to confirm): " \
                         vrf_raw </dev/tty
                     vrf_raw="${vrf_raw:-$global_vrf}"
-                    [[ -z "$vrf_raw" ]] && global_vrf="" || global_vrf="$vrf_raw"
+                    [[ -z "$vrf_raw" ]] && global_vrf="" || \
+                        global_vrf="$vrf_raw"
                 else
                     read -r -p \
                         "  VRF (Enter for GRT/none): " \
@@ -8977,14 +9180,17 @@ _mtp_configure_targets() {
         fi
 
         printf '%b  Unrecognised input "%s".%b\n' "$RED" "$_bind_raw" "$NC"
-        printf '%b  Enter: number | IP address | list | 0 or Enter for auto%b\n' \
+        printf '%b  Enter: number | IP | list | 0 or Enter for auto%b\n' \
             "$RED" "$NC"
     done
 
     echo ""
 
-    # ── Per-class target IP and port ───────────────────────────────────────
-    local last_target="" last_port=5200
+    # ── Per-class target IP and optional custom port ───────────────────────
+    local last_target=""
+    # For custom mode: track the suggested next port so the operator sees
+    # a sensible default even when overriding per-class.
+    local suggested_port=$MTP_BASE_PORT
 
     local ci
     for (( ci=0; ci<${#MTP_CLASSES[@]}; ci++ )); do
@@ -8992,12 +9198,15 @@ _mtp_configure_targets() {
         local cproto cpct cdscp cbw clabel
         IFS=':' read -r cproto cpct cdscp cbw clabel <<< "$class"
 
-        printf '%b  Class %d: %s  (%d%%)%b\n' \
-            "$CYAN" "$(( ci + 1 ))" "$clabel" "$cpct" "$NC"
+        printf '+%s+\n' "$(rpt '-' $inner)"
+        printf '%b  Class %d — %s  (%s / %d%%)%b\n' \
+            "$CYAN" "$(( ci + 1 ))" "$clabel" "$cproto" "$cpct" "$NC"
+        printf '+%s+\n' "$(rpt '-' $inner)"
 
         # Target IP
         local tgt_prompt="  Target IP"
-        [[ -n "$last_target" ]] && tgt_prompt="  Target IP [${last_target}]"
+        [[ -n "$last_target" ]] && \
+            tgt_prompt="  Target IP [${last_target}]"
         local tgt
         while true; do
             read -r -p "${tgt_prompt}: " tgt </dev/tty
@@ -9011,40 +9220,55 @@ _mtp_configure_targets() {
         done
         last_target="$tgt"
 
-        # Port
-        local default_port=$(( last_port + 1 ))
-        local port
-        while true; do
-            read -r -p "  Server port [${default_port}]: " port </dev/tty
-            port="${port:-$default_port}"
-            validate_port "$port" && { port=$(( 10#$port )); break; }
-            printf '%b  Invalid port.%b\n' "$RED" "$NC"
-        done
-        last_port=$port
+        # Port assignment based on selected mode
+        local class_port=0
 
-        # Validate bind IP against VRF for this specific target
-        # If bind_from_grt=1 and target routes via a VRF, warn the operator.
-        if [[ "$OS_TYPE" == "linux" && -n "$global_bind" && \
-              (( bind_from_grt == 0 )) && -n "$global_vrf" ]]; then
-            # Check that the bind IP belongs to the configured VRF
-            local _vrf_match=0 _vki
-            for (( _vki=0; _vki<${#IFACE_IPS[@]}; _vki++ )); do
-                if [[ "${IFACE_IPS[$_vki]}" == "$global_bind" && \
-                      "${IFACE_VRFS[$_vki]}" == "$global_vrf" ]]; then
-                    _vrf_match=1
-                    break
-                fi
-            done
-            if (( _vrf_match == 0 )); then
-                printf '%b  WARNING: bind IP %s not found in VRF %s.%b\n' \
-                    "$YELLOW" "$global_bind" "$global_vrf" "$NC"
-                printf '%b           Stream may fail — verify VRF membership.%b\n' \
-                    "$YELLOW" "$NC"
-            fi
-        fi
+        case "$MTP_PORT_MODE" in
+
+            auto)
+                # Port is computed in _mtp_calculate_streams — store 0
+                # as a placeholder. Show the operator what port will be used.
+                printf '%b  Port: auto-assigned from %d (sequential)%b\n' \
+                    "$DIM" "$suggested_port" "$NC"
+                class_port=0
+                # We don't know sc yet, but update suggestion by 1 so the
+                # display is approximately correct (exact value set in
+                # _mtp_calculate_streams).
+                suggested_port=$(( suggested_port + 1 ))
+                ;;
+
+            custom)
+                # Operator enters a specific base port for this class.
+                # Default suggestion is next available port.
+                local cp
+                while true; do
+                    printf "  Base port for this class [%d]: " \
+                        "$suggested_port"
+                    read -r cp </dev/tty
+                    cp="${cp:-$suggested_port}"
+                    validate_port "$cp" && {
+                        class_port=$(( 10#$cp ))
+                        break
+                    }
+                    printf '%b  Invalid port.%b\n' "$RED" "$NC"
+                done
+                # Advance suggestion so next class default avoids overlap.
+                # We advance by 1 here; _mtp_calculate_streams will handle
+                # the exact per-stream increment.
+                suggested_port=$(( class_port + 1 ))
+                ;;
+
+            single)
+                # All classes use the same single port.
+                class_port=$MTP_BASE_PORT
+                printf '%b  Port: %d (shared across all classes)%b\n' \
+                    "$DIM" "$class_port" "$NC"
+                ;;
+
+        esac
 
         MTP_TARGETS+=("$tgt")
-        MTP_PORTS+=("$port")
+        MTP_PORTS+=("$class_port")
         MTP_DURATIONS+=("$dur_val")
         MTP_BINDS+=("$global_bind")
         MTP_VRFS+=("$global_vrf")
@@ -9052,16 +9276,6 @@ _mtp_configure_targets() {
     done
 }
 
-# ---------------------------------------------------------------------------
-# _mtp_calculate_streams
-#
-# Given MTP_CLASSES and a total stream count, calculates per-class stream
-# counts and builds the flat stream configuration arrays that the launch
-# machinery expects (S_PROTO, S_TARGET, S_PORT, etc.).
-#
-# Uses a largest-remainder method to distribute streams so they sum exactly
-# to the requested total without rounding errors.
-# ---------------------------------------------------------------------------
 # ---------------------------------------------------------------------------
 # _mtp_calculate_streams  <total_streams>
 #
@@ -9206,8 +9420,9 @@ _mtp_calculate_streams() {
     S_FINAL_SENDER_BW=(); S_FINAL_RECEIVER_BW=()
     S_BIDIR=()
 
-    # ── Step 5: Populate stream arrays from class definitions ──────────────
+    # ── Step 5: Populate stream arrays ────────────────────────────────────
     local stream_idx=0
+    local next_port="${MTP_BASE_PORT:-5201}"  # running counter for auto mode
 
     for (( ci=0; ci<n_classes; ci++ )); do
         local class="${MTP_CLASSES[$ci]}"
@@ -9216,10 +9431,50 @@ _mtp_calculate_streams() {
 
         local sc="${final_counts[$ci]}"
         local tgt="${MTP_TARGETS[$ci]:-}"
-        local port="${MTP_PORTS[$ci]:-5201}"
         local dur="${MTP_DURATIONS[$ci]:-60}"
         local bind="${MTP_BINDS[$ci]:-}"
         local class_vrf="${MTP_VRFS[$ci]:-}"
+        local stored_port="${MTP_PORTS[$ci]:-0}"
+
+        # ── Determine base port for this class ─────────────────────────────
+        #
+        #   auto   — base port = next_port (global sequential counter)
+        #            After this class: next_port += sc  (no overlap ever)
+        #
+        #   custom — base port = stored_port (operator entered per-class)
+        #            Within the class, streams still increment: +0, +1, ...
+        #            next_port updated to stored_port + sc so the allocation
+        #            table display is accurate.
+        #
+        #   single — base port = MTP_BASE_PORT for every class and stream.
+        #            si is NOT added — all streams literally use the same port.
+
+        local class_base_port
+
+        case "${MTP_PORT_MODE:-auto}" in
+
+            auto)
+                class_base_port=$next_port
+                next_port=$(( class_base_port + sc ))
+                ;;
+
+            custom)
+                if (( stored_port > 0 )); then
+                    class_base_port=$stored_port
+                else
+                    # Fallback: stored_port was 0 (shouldn't happen in custom
+                    # mode, but guard against it)
+                    class_base_port=$next_port
+                fi
+                next_port=$(( class_base_port + sc ))
+                ;;
+
+            single)
+                class_base_port=$MTP_BASE_PORT
+                # next_port unchanged — all classes share the same port
+                ;;
+
+        esac
 
         # ── Resolve DSCP value ─────────────────────────────────────────────
         local dscp_val=-1
@@ -9233,26 +9488,19 @@ _mtp_calculate_streams() {
         fi
 
         # ── Per-stream bandwidth ───────────────────────────────────────────
-        # UDP streams must always have a bandwidth target.
-        # TCP streams default to unlimited (empty string).
         local bw_str=""
         if [[ "$cbw" != "0" && -n "$cbw" ]]; then
             bw_str="$cbw"
         elif [[ "$cproto" == "UDP" ]]; then
-            # Safe default for UDP so iperf3 does not try to saturate the link
             bw_str="1M"
         fi
 
-        # ── VRF / bind consistency resolution ─────────────────────────────
-        # Mirrors the logic in build_client_command and the pre-launch
-        # validation in launch_clients. Ensures the correct VRF is applied
-        # (or cleared) based on which interface actually owns the bind IP.
+        # ── VRF / bind consistency ─────────────────────────────────────────
         local stream_vrf="$class_vrf"
 
         if [[ "$OS_TYPE" == "linux" && -n "$bind" && \
               "$bind" != "0.0.0.0" ]]; then
 
-            # Find the VRF that actually owns the bind IP
             local _actual_vrf="GRT"
             local _vki
             for (( _vki=0; _vki<${#IFACE_IPS[@]}; _vki++ )); do
@@ -9263,48 +9511,42 @@ _mtp_calculate_streams() {
             done
 
             if [[ -n "$stream_vrf" ]]; then
-                # Case 1: VRF was configured but bind IP is in GRT
-                #         → clear VRF to avoid "bad file descriptor"
                 if [[ "$_actual_vrf" == "GRT" ]]; then
-                    printf '%b  [MTP] Class %d: bind IP %s is in GRT — ' \
+                    printf '%b  [MTP] Class %d: bind %s in GRT — ' \
                         "$YELLOW" "$(( ci+1 ))" "$bind"
                     printf 'clearing VRF "%s".%b\n' "$stream_vrf" "$NC"
                     stream_vrf=""
-
-                # Case 2: bind IP is in a different VRF than configured
-                #         → correct to the actual VRF
                 elif [[ "$_actual_vrf" != "$stream_vrf" ]]; then
-                    printf '%b  [MTP] Class %d: bind IP %s belongs to VRF "%s", ' \
+                    printf '%b  [MTP] Class %d: bind %s in VRF "%s" — ' \
                         "$YELLOW" "$(( ci+1 ))" "$bind" "$_actual_vrf"
-                    printf 'not "%s" — correcting.%b\n' "$stream_vrf" "$NC"
+                    printf 'correcting from "%s".%b\n' "$stream_vrf" "$NC"
                     stream_vrf="$_actual_vrf"
                     [[ "$stream_vrf" == "GRT" ]] && stream_vrf=""
                 fi
-
             else
-                # Case 3: no VRF was configured but bind IP lives in a VRF
-                #         → auto-apply the correct VRF
                 if [[ "$_actual_vrf" != "GRT" && -n "$_actual_vrf" ]]; then
-                    printf '%b  [MTP] Class %d: bind IP %s is in VRF "%s" — ' \
-                        "$CYAN" "$(( ci+1 ))" "$bind" "$_actual_vrf"
-                    printf 'auto-applying.%b\n' "$NC"
+                    printf '%b  [MTP] Class %d: bind %s auto-applying VRF "%s".%b\n' \
+                        "$CYAN" "$(( ci+1 ))" "$bind" "$_actual_vrf" "$NC"
                     stream_vrf="$_actual_vrf"
                 fi
             fi
 
-            # Warn if root is required for ip vrf exec
             if [[ -n "$stream_vrf" ]] && (( IS_ROOT == 0 )); then
-                printf '%b  [MTP] Class %d: VRF "%s" requires root (ip vrf exec).%b\n' \
+                printf '%b  [MTP] Class %d: VRF "%s" requires root.%b\n' \
                     "$YELLOW" "$(( ci+1 ))" "$stream_vrf" "$NC"
             fi
         fi
 
-        # ── Generate one stream entry per allocated stream ─────────────────
-        # Ports are incremented within a class to avoid collisions when
-        # multiple streams target the same server IP.
+        # ── Generate stream entries ────────────────────────────────────────
         local si
         for (( si=0; si<sc; si++ )); do
-            local stream_port=$(( port + si ))
+
+            # Port per stream
+            local stream_port
+            case "${MTP_PORT_MODE:-auto}" in
+                single) stream_port=$MTP_BASE_PORT ;;
+                *)      stream_port=$(( class_base_port + si )) ;;
+            esac
 
             S_PROTO+=("$cproto")
             S_TARGET+=("$tgt")
@@ -9429,9 +9671,19 @@ run_mixed_traffic_mode() {
 
     local preset_choice
     while true; do
-        read -r -p "  Select preset [1-6]: " preset_choice </dev/tty
-        [[ "$preset_choice" =~ ^[1-6]$ ]] && break
-        printf '%b  Enter 1-6.%b\n' "$RED" "$NC"
+        read -r -p "  Select [1-7]: " preset_choice </dev/tty
+        preset_choice="${preset_choice:-}"
+        case "$preset_choice" in
+            [1-6]) break ;;
+            7|q|Q)
+                printf '%b  Returning to main menu.%b\n\n' "$CYAN" "$NC"
+                return 0
+                ;;
+            *)
+                printf '%b  Enter 1-6 to select a preset, or 7 to return.%b\n' \
+                    "$RED" "$NC"
+                ;;
+        esac
     done
 
     _mtp_load_preset "$preset_choice"
@@ -9439,12 +9691,11 @@ run_mixed_traffic_mode() {
     if [[ "$preset_choice" == "6" ]]; then
         _mtp_define_custom_mix
         if (( ${#MTP_CLASSES[@]} == 0 )); then
-            printf '%b  No classes defined. Returning to menu.%b\n' "$RED" "$NC"
-            return 1
+            printf '%b  No classes defined. Returning to menu.%b\n' \
+                "$RED" "$NC"
+            return 0
         fi
     fi
-
-    echo ""
 
     # ── Step 2: Total stream count ─────────────────────────────────────────
     local total_streams
@@ -10573,6 +10824,8 @@ main_menu() {
                 S_CWND_CURRENT=(); S_CWND_MIN=(); S_CWND_MAX=()
                 S_CWND_FINAL=(); S_CWND_SAMPLES=(); S_CWND_HISTORY=()
                 S_BIDIR=()
+                MTP_BASE_PORT=5201
+                MTP_PORT_MODE="auto"
                 if (( BASH_MAJOR >= 4 )); then
                     PMTU_RESULTS=(); PMTU_STATUS=(); PMTU_RECOMMEND=()
                 fi
