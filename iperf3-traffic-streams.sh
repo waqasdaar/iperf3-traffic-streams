@@ -3799,6 +3799,14 @@ _cleanup_stream_procs() {
         printf '[%s]  %s\n' "$(date +%T)" "$*" >> "$_log_file"
     }
 
+    # ── Guarantee CLEANED is always set when this function exits ──────────
+    # If any step below fails silently (subprocess error, timeout, etc.)
+    # the trap ensures the state machine can still progress to exit.
+    # Without this, a failed step leaves S_STATUS_CACHE in CLEANUP_PENDING
+    # or DONE forever, causing the dashboard to loop indefinitely.
+    local _cleanup_idx="$idx"
+    trap 'S_STATUS_CACHE[$_cleanup_idx]="CLEANED"' RETURN
+
     # ─────────────── 1. Terminate iperf3 client process ────────────────────────────────
     local cpid="${STREAM_PIDS[$idx]:-0}"
     if [[ "$cpid" != "0" && "$cpid" =~ ^[0-9]+$ ]]; then
@@ -3829,19 +3837,15 @@ _cleanup_stream_procs() {
         PING_PIDS[$idx]=0
     fi
 
-    # Fallback: find ping process by log file path and kill it
-    # This catches cases where PING_PIDS[$idx] was 0 due to array mismatch
+    # Fallback: find ping process by log file path — with timeout guard
     local rtt_log="${PING_LOGFILES[$idx]:-${TMPDIR}/rtt_${idx}.log}"
     if [[ -n "$rtt_log" ]]; then
-        # Find any ping process that has this log file open for writing
         local stray_pid
         if [[ "$OS_TYPE" == "linux" ]]; then
-            # Use /proc to find processes writing to the rtt log
-            stray_pid=$(fuser "$rtt_log" 2>/dev/null | tr ' ' '\n' \
-                | grep -E '^[0-9]+$' | head -1)
+            stray_pid=$(timeout 2 fuser "$rtt_log" 2>/dev/null \
+                | tr ' ' '\n' | grep -E '^[0-9]+$' | head -1)
         else
-            # macOS: use lsof
-            stray_pid=$(lsof -t "$rtt_log" 2>/dev/null | head -1)
+            stray_pid=$(timeout 2 lsof -t "$rtt_log" 2>/dev/null | head -1)
         fi
         if [[ -n "$stray_pid" && "$stray_pid" =~ ^[0-9]+$ ]]; then
             if kill -0 "$stray_pid" 2>/dev/null; then
@@ -3867,15 +3871,15 @@ _cleanup_stream_procs() {
         BIDIR_PIDS[$idx]=0
     fi
 
-    # Fallback: find bidir process by log file path
+    # Bidir fallback — also with timeout
     local bidir_log="${BIDIR_LOGFILES[$idx]:-}"
     if [[ -n "$bidir_log" && "$bidir_log" != "${S_LOGFILE[$idx]:-}" ]]; then
         local stray_bpid=""
         if [[ "$OS_TYPE" == "linux" ]]; then
-            stray_bpid=$(fuser "$bidir_log" 2>/dev/null | tr ' ' '\n' \
-                | grep -E '^[0-9]+$' | head -1)
+            stray_bpid=$(timeout 2 fuser "$bidir_log" 2>/dev/null \
+                | tr ' ' '\n' | grep -E '^[0-9]+$' | head -1)
         else
-            stray_bpid=$(lsof -t "$bidir_log" 2>/dev/null | head -1)
+            stray_bpid=$(timeout 2 lsof -t "$bidir_log" 2>/dev/null | head -1)
         fi
         if [[ -n "$stray_bpid" && "$stray_bpid" =~ ^[0-9]+$ ]]; then
             if kill -0 "$stray_bpid" 2>/dev/null; then
@@ -3888,6 +3892,7 @@ _cleanup_stream_procs() {
         fi
         BIDIR_PIDS[$idx]=0
     fi
+
 
     # ── 4. Remove tc netem for this stream ────────────────────────────────
     # Lifts network impairment on the stream's egress interface immediately
@@ -8053,12 +8058,6 @@ run_dashboard() {
         fi
 
         # ── Exit condition (client mode) ───────────────────────────────────
-        # Check whether all streams have reached a terminal state.
-        # When all finished: set _dashboard_running=0 but do NOT continue.
-        # The loop will exit cleanly at the top of the next iteration after
-        # the keyboard poll below completes (or breaks immediately).
-        # This ensures the CLEANED tombstone rows are visible for at least
-        # one full render cycle before the dashboard closes.
         if [[ "$mode" != "server" ]]; then
             local _all_finished=1
             local j
@@ -8066,12 +8065,30 @@ run_dashboard() {
                 local _jst="${S_STATUS_CACHE[$j]:-STARTING}"
                 case "$_jst" in
                     CLEANED|FAILED)
-                        # Terminal state — this stream is done
+                        # Terminal states — done
                         ;;
                     CLEANUP_PENDING)
-                        # Cleanup ran this tick (queued=2): treat as finished.
-                        # Cleanup not yet run (queued=1): still in progress.
+                        # cleanup ran this tick (queued=2) → treat as done
+                        # cleanup not yet run (queued=1) → still in progress
                         if [[ "${S_CLEANUP_QUEUED[$j]:-0}" != "2" ]]; then
+                            _all_finished=0
+                        fi
+                        ;;
+                    DONE)
+                        # DONE with queued=2 means _cleanup_stream_procs was
+                        # called but failed to set CLEANED (e.g. early return
+                        # due to a subprocess error). Force CLEANED now so
+                        # the dashboard can exit rather than looping forever.
+                        if [[ "${S_CLEANUP_QUEUED[$j]:-0}" == "2" ]]; then
+                            S_STATUS_CACHE[$j]="CLEANED"
+                        else
+                            # cleanup has not been attempted yet — Phase A
+                            # should handle this, but if queued is still 0
+                            # trigger it directly here as a safety net
+                            if [[ "${S_CLEANUP_QUEUED[$j]:-0}" == "0" ]]; then
+                                S_CLEANUP_QUEUED[$j]="1"
+                                S_STATUS_CACHE[$j]="CLEANUP_PENDING"
+                            fi
                             _all_finished=0
                         fi
                         ;;
@@ -8083,10 +8100,6 @@ run_dashboard() {
             done
 
             if (( _all_finished == 1 )); then
-                # Mark loop to exit — do NOT use 'continue' here.
-                # Fall through to the keyboard poll so it can break
-                # immediately on the _dashboard_running == 0 check,
-                # then the while condition exits the loop cleanly.
                 _dashboard_running=0
             fi
         fi
