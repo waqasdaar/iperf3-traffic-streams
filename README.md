@@ -211,17 +211,17 @@ iperf3 --version
 ```
 ## Step 2 — Get the Script
 ```
-git clone https://github.com/waqasdaar/iperf3-traffic-streams.git
-cd iperf3-traffic-streams
+git clone https://github.com/waqasdaar/prism.git
+cd prism
 ```
 ## Step 3 — Set Execute Permission
 ```
-chmod +x iperf3-traffic-streams.sh
+chmod +x prism.sh
 ```
 ## Step 4 — Optional System-Wide Installation
 ```
-sudo cp iperf3_manager.sh /usr/local/bin/iperf3-traffic-streams.sh
-sudo chmod +x /usr/local/bin/iperf3-traffic-streams.sh
+sudo cp prism.sh /usr/local/bin/prism.sh
+sudo chmod +x /usr/local/bin/prism.sh
 ```
 ## Step 5 — Verify Everything Is Ready
 ```
@@ -236,31 +236,36 @@ ip -V
 ss --version
 
 # Run the script
-sudo ./iperf3-traffic-streams.sh
+sudo ./prism.sh
 ```
 **Expected Launch Screen**
 
 ```
 +==============================================================================+
-|                                                                              |
-|             iperf3 Multi-Stream Traffic Manager  v7.7                        |
-|                                                                              |
+|        PRISM  Performance Real-time iPerf3 Stream Manager  v8.3.1        |
 +==============================================================================+
-|  iperf3 3.9   at /usr/bin/iperf3                                             |
-|  Running as: root  (full feature access)                                     |
-|                                                                              |
+| iperf3 3.16.0  at /usr/bin/iperf3                                            |
+| User  root  ·  Theme  dark  ·  OS  linux                                     |
++==============================================================================+
+|  NETWORK                                                                    |
 +------------------------------------------------------------------------------+
-|                                                                              |
-|   1   Interface Table                                                        |
-|   2   Server Mode   --  start iperf3 listener(s)                             |
-|   3   Client Mode   --  generate traffic stream(s)                           |
-|   4   Loopback Test --  local server + client validation                     |
-|   5   DSCP Reference Table                                                   |
-|   6   Exit                                                                   |
-|                                                                              |
+|  1  Interface Table      List interfaces, IPs, VRFs and link state           |
+|  2  Server Mode          Launch one or more iperf3 listeners                 |
+|  3  Client Mode          Generate traffic streams with full QoS control      |
+|  4  Loopback Test        Self-contained server + client validation           |
+|  5  Mixed Traffic        Generate streams from a traffic mix definition      |
++------------------------------------------------------------------------------+
+|  REFERENCE                                                                  |
++------------------------------------------------------------------------------+
+|  6  DSCP Reference       DSCP / TOS / EF / AF / CS class mappings            |
+|  7  Colour Theme         Dark · Light · Mono  (active: dark)                 |
++------------------------------------------------------------------------------+
+|  SESSION                                                                    |
++------------------------------------------------------------------------------+
+|  8  Exit                                                                     |
 +==============================================================================+
 
-  Select [1-6]:
+  Select [1-8]: 8
 ```
 ## Quick Start
 60-Second Bandwidth Test Between Two Hosts
