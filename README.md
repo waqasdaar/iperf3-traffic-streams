@@ -555,3 +555,57 @@ PRISM tries each resolver in order, stopping at the first success:
 | 4        | nslookup                       | Legacy; available almost everywhere              |
 | 5        | python3 socket.gethostbyname() | Uses system resolver stack                       |
 | 6        | python2 socket.gethostbyname() | Older system fallback                            |
+
+### Use Case 9 — Network Impairment Simulation (tc netem)
+
+**Scenario:** Reproduce WAN conditions (100 ms RTT, 10 ms jitter, 0.5% packet loss) on a lab host to test application resilience before production deployment.
+
+```
+Menu:      3 — Client Mode
+Protocol:  TCP
+Target:    10.0.0.1
+Duration:  60
+Delay:     100  ms
+Jitter:    10   ms
+Loss:      0.5  %
+```
+
+PRISM applies `tc netem` to the correct egress interface via a VRF-aware route lookup and displays a before/after comparison table:
+
+```
++==============================================================================+
+|              tc netem Applied — Stream 1                                     |
++------------------------------------------------------------------------------+
+|  Interface : eth0  (routing via GRT)                                         |
+|  Stream    : 1  TCP → 10.0.0.1:5201                                          |
++------------------------------------------------------------------------------+
+|  Parameter     | Before     | After      | Change    |
+|----------------|------------|------------|-----------|
+|  Delay         | 0ms        | 100ms      | added     |
+|  Jitter        | 0ms        | 10ms       | added     |
+|  Packet Loss   | 0%         | 0.5%       | added     |
++==============================================================================+
+```
+Netem is automatically removed when the stream finishes via the per-stream cleanup handler.
+
+### Use Case 10 — VRF-Aware Multi-Tenant Testing
+
+**Scenario:** Run simultaneous iperf3 streams across two separate VRFs on an SD-WAN or multi-tenant router, verifying traffic isolation.
+
+```
+Menu:     3 — Client Mode
+Streams:  2
+
+Stream 1:
+  Target:   10.1.1.1
+  VRF:      tenant-a
+  Bind IP:  10.1.0.1  (interface in tenant-a)
+  DSCP:     AF21
+
+Stream 2:
+  Target:   10.2.1.1
+  VRF:      tenant-b
+  Bind IP:  10.2.0.1  (interface in tenant-b)
+  DSCP:     CS1
+```
+**PRISM** validates that each bind IP belongs to the specified VRF before launch, auto-corrects mismatches, and executes each iperf3 process inside the correct VRF namespace via `ip vrf exec`. Both streams appear simultaneously in the live dashboard with independent bandwidth readings.
