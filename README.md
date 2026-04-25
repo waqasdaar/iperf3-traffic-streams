@@ -317,3 +317,15 @@ Every time **PRISM** launches it displays the Capability Matrix showing which fe
 |  8  Exit                                                                     |
 +==============================================================================+
 ```
+## Application Menu
+
+|        Option       |                                                                                                                      Description                                                                                                                      |
+|:-------------------:|:-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------:|
+| 1 — Interface Table | Displays all network interfaces with their IP address, operational  state, link speed, and VRF membership. Use this to identify the correct  bind interface before running a test.                                                                    |
+| 2 — Server Mode     | Configures and launches one or more iperf3 listeners. Each listener  can be bound to a specific IP and VRF. A live server dashboard shows  per-listener bandwidth, connection state, and sparkline. Press c in the dashboard for live packet capture. |
+| 3 — Client Mode     | The primary test mode. Configures up to 64 streams, each with  independent protocol, target, bandwidth cap, DSCP marking, DSCP  verification, VRF, bind interface, netem impairment, bidir, CWND  tracking, and ramp profile.                         |
+| 4 — Loopback Test   | Automatically launches local iperf3 servers and clients on 127.0.0.1. No remote infrastructure required. Ideal for baseline validation, regression testing, and smoke tests after a system change.                                                    |
+| 5 — Mixed Traffic   | Generates a multi-class traffic mix defined by percentage. Choose  from five built-in enterprise presets or define a fully custom mix  interactively. Streams are automatically allocated and launched.                                               |
+| 6 — DSCP Reference  | Displays the complete DSCP / TOS mapping table with PHB classes and use cases, without running a test.                                                                                                                                                |
+| 7 — Colour Theme    | Switches between Dark, Light, and Mono terminal themes. The selection is persisted to ~/.config/prism/theme and reloaded on next launch. A live colour swatch confirms the change.                                                                    |
+| 8 — Exit            | Terminates all active iperf3 and ping processes, removes tc qdiscs,  deletes temporary files, and prompts about JSON export file retention  before exiting.                                                                                           |
