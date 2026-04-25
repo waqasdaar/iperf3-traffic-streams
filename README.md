@@ -399,3 +399,42 @@ Stream 3:  TCP · AF21 · 0     · "Business data (unlimited)"
 Stream 4:  TCP · CS1  · 0     · "Background backup (unlimited)"
 ```
 The live dashboard displays all four streams simultaneously with individual bandwidth readings, sparklines, RTT rows, CWND rows (for TCP streams), and DSCP labels. The final results table shows sender and receiver bandwidth for each class side by side.
+
+### Use Case 4 — Enterprise WAN Mix with Mixed Traffic Generator
+
+**Scenario:** Simulate a realistic enterprise WAN traffic profile to capacity-plan a new MPLS circuit before cutover.
+
+```
+Menu:    5 — Mixed Traffic
+Preset:  1 — Enterprise WAN
+         → 70% TCP Bulk (AF11)
+         → 20% UDP Voice/RTP (EF)
+         → 10% UDP Low-priority (CS1)
+
+Total streams: 10
+Target:        10.1.1.1
+Duration:      120
+Port mode:     Auto sequential (from 5201)
+```
+
+**PRISM** automatically allocates 7 TCP bulk streams, 2 UDP voice streams, and 1 UDP low-priority stream using the largest-remainder method, assigns ports sequentially from 5201, and launches all 10 streams simultaneously. The mixed traffic dashboard shows every stream with its class label, protocol, DSCP, and live bandwidth.
+
+**Built-in presets**
+
+| # |     Preset     |                            Mix Definition                            |
+|:-:|:--------------:|:--------------------------------------------------------------------:|
+| 1 | Enterprise WAN | 70% TCP Bulk (AF11) · 20% UDP RTP (EF) · 10% UDP Low (CS1)           |
+| 2 | Data Centre    | 60% TCP Bulk (AF21) · 30% TCP iSCSI (AF31) · 10% UDP Mgmt (CS2)      |
+| 3 | Unified Comms  | 50% UDP Voice (EF) · 30% UDP Video (AF41) · 20% TCP Signalling (CS3) |
+| 4 | Bulk Transfer  | 80% TCP Bulk (AF11) · 20% TCP Background (CS1)                       |
+| 5 | Multimedia CDN | 65% TCP HTTPS (AF31) · 25% UDP Stream (AF41) · 10% UDP Low (CS1)     |
+| 6 | Custom Mix     | Define your own percentages and classes interactively                |
+
+**Port allocation modes**
+
+|       Mode       |                              Description                             |
+|:----------------:|:--------------------------------------------------------------------:|
+| Auto Sequential  | One base port; each class increments automatically. No manual entry. |
+| Custom Per-Class | Specify a different base port for each traffic class.                |
+| Single Port All  | All streams across all classes share one port.                       |
+
