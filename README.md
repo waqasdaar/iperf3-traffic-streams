@@ -1047,3 +1047,143 @@ On exit, if JSON export files were created during the session, PRISM prompts:
   Choice [N]:
 ```
 The default is always **keep** (`N`) to prevent accidental data loss.
+
+## Troubleshooting
+### iperf3 not found
+```
+PRISM ERROR: iperf3 not found.
+Install: apt install iperf3 | yum install iperf3
+```
+**Fix:** Install iperf3 for your distribution. For the latest version download a static binary from the [iperf3 releases page](https://github.com/esnet/iperf/releases).
+
+### Stream fails immediately — Connection refused
+```
+FAILED: Connection refused — is iperf3 server on 10.0.0.1:5201?
+```
+**Fix:** Ensure iperf3 is running on the remote host and the port matches:
+```
+# On the remote server:
+iperf3 -s -p 5201
+
+# Verify it is listening:
+ss -tlnp | grep 5201
+```
+Check that any firewall on the server host allows inbound TCP/UDP on the configured port.
+
+### Stream fails — Bad file descriptor (VRF mismatch)
+
+```
+FAILED: Bad file descriptor — VRF/bind IP mismatch or iperf3 server not reachable
+```
+
+**Cause:** The bind IP belongs to a GRT interface but a VRF was configured, or the bind IP belongs to a different VRF than specified.
+
+**Fix:** PRISM auto-corrects this during the pre-launch validation pass and will print a `[PRE-LAUNCH FIX]` message. To diagnose manually:
+
+```
+# Identify which VRF owns a bind IP
+ip -4 addr show | grep <bind-ip>
+
+# Verify routing from within a VRF
+ip route get vrf <vrf-name> <target-ip>
+```
+### tc shaping not applied — ramp-up silently skipped
+
+**Cause:** `tc tbf` requires root privileges and a non-loopback interface.
+
+**Fix:** Run PRISM as root:
+```
+sudo ./prism.sh
+```
+Verify `tc` is installed and the capability matrix shows `[ OK ]` for TCP Ramp-Up
+
+```
+which tc || sudo apt install iproute2
+```
+
+Loopback targets (`127.x.x.x`) cannot be shaped — use a real network interface for ramp-up tests.
+
+### DSCP verification returns "No packets captured"
+
+**Possible causes and fixes:**
+
+1. **Stream not yet sending data:** Wait until the stream shows `CONNECTED` before pressing `v`.
+
+2. **Insufficient privileges:** tcpdump requires root or `CAP_NET_RAW`:
+```
+sudo ./prism.sh
+```
+3. **Hardware offload rewriting TOS:** The NIC may be stripping DSCP before the kernel sees it. Disable tx offload:
+```
+sudo ethtool -K <interface> tx-checksumming off
+```
+4. **Firewall or policy remarking:** A QoS policy between the capture point and the wire may be rewriting the DSCP value. This is a finding — PRISM's FAIL verdict in this case is correct.
+
+### DNS resolution fails for FQDN targets
+```
+Resolving iperf3.moji.fr... FAILED
+  Could not resolve "iperf3.moji.fr"
+```
+
+**Fix:** Verify at least one resolver tool is available:
+
+```
+which getent dig host nslookup python3
+```
+Check DNS is configured and working on the host:
+```
+cat /etc/resolv.conf
+getent hosts iperf3.moji.fr
+dig +short A iperf3.moji.fr
+```
+
+If the target is in a private DNS zone, ensure the test host uses the correct nameserver and search domain.
+
+### Bidir test fails with "parameter error"
+```
+iperf3: parameter error - cannot be both reverse and bidirectional
+```
+**Cause:** An older iperf3 binary that reports a version ≥ 3.7 but does not properly support `--bidir`.
+
+**Fix:** Check the actual iperf3 version on both client and server:
+
+```
+iperf3 --version
+```
+Upgrade to **iperf3 3.9** or later for stable `--bidir` support.
+
+### Dashboard drifts or content overlaps after terminal resize
+
+**Cause:** PRISM pre-calculates the frame height before the first tick. A resize mid-test causes a one-tick misalignment.
+
+**Fix:** Resize the terminal between tests, not during. The dashboard self-corrects on the next one-second tick via `printf '\033[J'` (erase to end of screen).
+
+### Path MTU shows UNKNOWN for all targets
+
+**Cause:** ICMP echo requests are blocked by a host-based firewall, a transit ACL, or the target itself does not respond to ping.
+
+**Fix:** This is informational. PRISM will still proceed using the interface MTU as the default. To investigate:
+
+```
+# Test ICMP with DF bit set manually
+ping -M do -s 1400 -c 3 <target>
+
+# Check local firewall
+iptables -L -n | grep icmp
+```
+
+### JSON export file not created
+
+**Cause:** `JSON_EXPORT_ENABLED` is only set to 1 after the session naming prompt. If the operator presses `Ctrl+C` before the prompt completes, no export is written.
+
+**Fix:** Allow the session naming prompt to complete (pressing Enter through all fields is sufficient to accept the auto-generated ID).
+### Session history not written
+
+**Cause:** The directory `~/.config/prism/` cannot be created, or the filesystem is read-only.
+
+**Fix:**
+```
+mkdir -p ~/.config/prism
+ls -la ~/.config/prism/
+```
+Ensure the user running PRISM has write access to their home directory.
