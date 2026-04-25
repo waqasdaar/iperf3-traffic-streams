@@ -2,7 +2,7 @@
 
 > Enterprise-grade multi-stream traffic orchestration with a live QoS dashboard.
 
-[![Version](https://img.shields.io/badge/version-8.3.8-blue.svg)](https://github.com/waqasdaar/prism)
+[![Version](https://img.shields.io/badge/version-8.3.9-blue.svg)](https://github.com/waqasdaar/prism)
 [![Shell](https://img.shields.io/badge/shell-Bash%203.2%2B-green.svg)](https://www.gnu.org/software/bash/)
 [![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20macOS-lightgrey.svg)](https://github.com/waqasdaar/prism)
 [![License](https://img.shields.io/badge/license-MIT-orange.svg)](LICENSE)
