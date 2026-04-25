@@ -291,4 +291,29 @@ Every time **PRISM** launches it displays the Capability Matrix showing which fe
 +==============================================================================+
 ```
 
+## Application Menu
 
+```
++==============================================================================+
+|          PRISM  Performance Real-time iPerf3 Stream Manager  v8.3.8          |
++==============================================================================+
+|  User  root  ·  Theme  dark  ·  OS  linux                                   |
++==============================================================================+
+|  NETWORK                                                                     |
++------------------------------------------------------------------------------+
+|  1  Interface Table      List interfaces, IPs, VRFs and link state           |
+|  2  Server Mode          Launch one or more iperf3 listeners                 |
+|  3  Client Mode          Generate traffic streams with full QoS control      |
+|  4  Loopback Test        Self-contained server + client validation           |
+|  5  Mixed Traffic        Generate streams from a traffic mix definition      |
++------------------------------------------------------------------------------+
+|  REFERENCE                                                                   |
++------------------------------------------------------------------------------+
+|  6  DSCP Reference       DSCP / TOS / EF / AF / CS class mappings           |
+|  7  Colour Theme         Dark · Light · Mono  (active: dark)                 |
++------------------------------------------------------------------------------+
+|  SESSION                                                                     |
++------------------------------------------------------------------------------+
+|  8  Exit                                                                     |
++==============================================================================+
+```
