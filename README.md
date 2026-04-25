@@ -609,3 +609,74 @@ Stream 2:
   DSCP:     CS1
 ```
 **PRISM** validates that each bind IP belongs to the specified VRF before launch, auto-corrects mismatches, and executes each iperf3 process inside the correct VRF namespace via `ip vrf exec`. Both streams appear simultaneously in the live dashboard with independent bandwidth readings.
+
+### Use Case 11 — Server Mode with Live Dashboard
+
+**Scenario:** Run PRISM as a persistent multi-listener server, accepting connections from multiple remote clients simultaneously.
+
+```
+Menu:        2 — Server Mode
+Listeners:   2
+
+Listener 1:  port 5201, bind 0.0.0.0, VRF: GRT
+Listener 2:  port 5202, bind 10.5.0.1, VRF: prod-vrf
+```
+
+The live server dashboard shows each listener's lifecycle state and live bandwidth:
+
+```
++==============================================================================+
+|                      PRISM — Server Dashboard                                |
++==============================================================================+
+|  Listeners active: 1 / 2                                                    |
++==============================================================================+
+|  #   Port   Bind IP            VRF       Bandwidth      Last 10s    Status  |
++------------------------------------------------------------------------------+
+|  1   5201   0.0.0.0            GRT       940.12 Mbps    ▅▆▇████████ CONNECTED|
++------------------------------------------------------------------------------+
+|  2   5202   10.5.0.1           prod-vrf  ---            ··········  LISTENING|
++==============================================================================+
+|  Ctrl+C to stop all listeners  |  [c] Packet capture                        |
++==============================================================================+
+```
+
+Press **`c`** in the server dashboard to open the DSCP capture overlay for any active listener.
+
+### Use Case 12 — Session Naming and Audit Trail
+
+**Scenario:** Run a series of before/after change tests and maintain a traceable audit log for change management records.
+
+Before each test run, PRISM presents the session naming panel:
+
+```
++==============================================================================+
+|        Test Session Naming  (optional — press Enter to skip each field)      |
++==============================================================================+
+|  Session ID:  20260425-143022-a3f1                                           |
++------------------------------------------------------------------------------+
+
+  Session Name
+  Examples: baseline-Q1  post-firewall-change  WAN-link-test-2026
+
+  Name [20260425-143022-a3f1]: wan-baseline-Q2
+  ✓ Name set to: wan-baseline-Q2
+
+  Tags [none]: pre-change production wan
+  ✓ Tags set: [pre-change] [production] [wan]
+
+  Note [none]: Before firewall policy update ticket CHG-4821
+  ✓ Note set.
+```
+
+The session record is appended to `~/.config/prism/session_history.json` in JSON Lines format and embedded in the per-test JSON export file. Use `jq` to query test history:
+
+```
+# Find all tests tagged "production"
+grep '"production"' ~/.config/prism/session_history.json | jq '.name,.results'
+
+# Compare sender bandwidth across baseline and post-change runs
+jq 'select(.name | startswith("wan-baseline")) | .results[].sender_bw' \
+    ~/.config/prism/session_history.json
+```
+
+
