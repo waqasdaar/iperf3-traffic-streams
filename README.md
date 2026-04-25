@@ -789,3 +789,179 @@ When streams finish, PRISM renders additional panels below the main dashboard fr
 
 **Failed Streams panel** — appears if any stream reaches `FAILED` state, showing the error message (e.g. "Connection refused", "No route to host").
 
+## DSCP Reference Table
+
+**PRISM** uses DSCP (Differentiated Services Code Point) values to mark traffic for QoS treatment. At the DSCP prompt, enter the name (e.g. `EF`), a decimal value (0–63), or press Enter for no marking.
+
+```
+TOS byte = DSCP value × 4
+```
+
+| **DSCP Name** | **Value** | **TOS (dec)** | **TOS (hex)** |  **PHB Class**  |        **Typical Use Case**       |
+|:-------------:|:---------:|:-------------:|:-------------:|:---------------:|:---------------------------------:|
+| Default / CS0 | 0         | 0             | 0x00          | Best Effort     | Default internet traffic          |
+| CS1           | 8         | 32            | 0x20          | Scavenger       | Low-priority bulk, backup         |
+| AF11          | 10        | 40            | 0x28          | AF Class 1      | Low data, low drop probability    |
+| AF12          | 12        | 48            | 0x30          | AF Class 1      | Low data, medium drop             |
+| AF13          | 14        | 56            | 0x38          | AF Class 1      | Low data, high drop               |
+| CS2           | 16        | 64            | 0x40          | OAM             | Network management, SNMP          |
+| AF21          | 18        | 72            | 0x48          | AF Class 2      | High-throughput data, low drop    |
+| AF22          | 20        | 80            | 0x50          | AF Class 2      | High-throughput data, medium drop |
+| AF23          | 22        | 88            | 0x58          | AF Class 2      | High-throughput data, high drop   |
+| CS3           | 24        | 96            | 0x60          | Broadcast Video | Signalling, broadcast video       |
+| AF31          | 26        | 104           | 0x68          | AF Class 3      | Multimedia streaming, low drop    |
+| AF32          | 28        | 112           | 0x70          | AF Class 3      | Multimedia streaming, medium drop |
+| AF33          | 30        | 120           | 0x78          | AF Class 3      | Multimedia streaming, high drop   |
+| CS4           | 32        | 128           | 0x80          | Real-time       | Real-time interactive             |
+| AF41          | 34        | 136           | 0x88          | AF Class 4      | Video conferencing, low drop      |
+| AF42          | 36        | 144           | 0x90          | AF Class 4      | Video conferencing, medium drop   |
+| AF43          | 38        | 152           | 0x98          | AF Class 4      | Video conferencing, high drop     |
+| CS5           | 40        | 160           | 0xa0          | Signalling      | SIP call control                  |
+| VA            | 44        | 176           | 0xb0          | Voice Admit     | CAC-admitted voice                |
+| EF            | 46        | 184           | 0xb8          | Expedited       | VoIP, low-latency voice           |
+| CS6           | 48        | 192           | 0xc0          | Network Control | BGP, OSPF, IS-IS                  |
+| CS7           | 56        | 224           | 0xe0          | Reserved        | Network critical, reserved        |
+
+## Output and Log Files
+
+### Temporary stream logs
+
+During a test, PRISM writes all iperf3 and ping output to a temporary directory created at startup:
+
+```
+/tmp/iperf3_streams.XXXXXX/
+├── stream_1.log       # iperf3 client stdout/stderr for stream 1
+├── stream_1.sh        # Generated iperf3 launch script for stream 1
+├── stream_2.log       # iperf3 client stdout/stderr for stream 2
+├── stream_2.sh        # Generated iperf3 launch script for stream 2
+├── rtt_0.log          # Continuous ping output for stream 1 (0-based index)
+├── rtt_1.log          # Continuous ping output for stream 2
+├── bidir_1.log        # Reverse process log (legacy bidir, iperf3 < 3.7 only)
+├── server_1.log       # iperf3 server output (Server Mode / Loopback Mode)
+└── dscp_cap_0_*.txt   # Temporary tcpdump capture (deleted immediately)
+```
+
+All files in the temporary directory are deleted by Phase 2 cleanup after the results table is displayed. The directory itself is then removed.
+
+### JSON results export
+
+After each named-session test, PRISM writes a structured JSON file to the same directory as `prism.sh` (or the current working directory as fallback):
+
+```
+./prism_20260425-143022-a3f1.json
+```
+**Complete schema**
+
+```
+{
+  "schema_version": "1.0",
+  "session": {
+    "id":           "20260425-143022-a3f1",
+    "name":         "wan-baseline-Q2",
+    "tags":         ["pre-change", "wan", "production"],
+    "note":         "Before firewall policy update",
+    "started":      1745000000,
+    "finished":     1745000120,
+    "duration_sec": 120,
+    "host":         "emea-edge-madrid",
+    "user":         "root",
+    "os":           "Linux 5.15.0-101-generic",
+    "iperf3":       "3.16.0",
+    "iperf3_bin":   "/usr/bin/iperf3",
+    "mode":         "client"
+  },
+  "streams": [
+    {
+      "stream":        1,
+      "proto":         "TCP",
+      "target":        "10.0.0.1",
+      "port":          5201,
+      "bandwidth":     "unlimited",
+      "duration_sec":  60,
+      "dscp_name":     "EF",
+      "dscp_val":      46,
+      "parallel":      1,
+      "bidir":         false,
+      "reverse":       false,
+      "bind_ip":       "10.0.0.2",
+      "vrf":           "",
+      "ramp_enabled":  false,
+      "status":        "DONE",
+      "summary": {
+        "sender_bw":      "940.12 Mbps",
+        "receiver_bw":    "938.50 Mbps",
+        "retransmits":    "0",
+        "jitter_ms":      "",
+        "loss_pct":       "",
+        "rtt_min_ms":     "1.100",
+        "rtt_avg_ms":     "1.234",
+        "rtt_max_ms":     "1.890",
+        "rtt_jitter_ms":  "0.123",
+        "rtt_loss_pct":   "0%",
+        "rtt_samples":    60,
+        "cwnd_min_kb":    "90.1",
+        "cwnd_max_kb":    "128.0",
+        "cwnd_avg_kb":    "110.5",
+        "cwnd_final_kb":  "125.0"
+      },
+      "samples": [
+        {"t": 1745000001, "bps": 985400320},
+        {"t": 1745000002, "bps": 987234560},
+        {"t": 1745000003, "bps": 990123456}
+      ]
+    }
+  ]
+}
+```
+
+#### Analysing results with jq
+
+```
+# Show session metadata and all stream summaries
+jq '.session, .streams[].summary' prism_20260425-143022-a3f1.json
+
+# Extract per-second bandwidth time-series for stream 1
+jq '.streams[0].samples' prism_20260425-143022-a3f1.json
+
+# List sender bandwidth for every stream
+jq '.streams[] | {stream, sender_bw: .summary.sender_bw}' \
+    prism_20260425-143022-a3f1.json
+
+# Calculate average bps from samples using jq arithmetic
+jq '[.streams[0].samples[].bps] | add / length' \
+    prism_20260425-143022-a3f1.json
+
+# Find sessions tagged "production" in the history log
+grep '"production"' ~/.config/prism/session_history.json | jq .
+
+# Get all sessions where any stream failed
+jq 'select(.results[].status == "FAILED")' \
+    ~/.config/prism/session_history.json
+
+# Compare sender BW across two named sessions
+jq 'select(.name | test("wan-baseline")) | {name, results: [.results[].sender_bw]}' \
+    ~/.config/prism/session_history.json
+```
+
+### Session history log
+
+Every completed test with a named session is appended as a single-line JSON record to:
+
+```
+~/.config/prism/session_history.json
+```
+
+This file uses **JSON Lines format** — one complete JSON object per line. It is directly consumable by `jq`, Python `json.loads()`, and any log aggregation or SIEM tool without requiring a JSON array wrapper.
+
+### Colour theme preference
+```
+~/.config/prism/theme
+```
+Contains one word: `dark`, `light`, or `mono`. Written when a theme is selected in the Theme menu. Auto-detected from `COLORFGBG` on first run if no saved preference exists.
+
+### Event log (runtime only)
+
+```
+/tmp/iperf3_streams_events.log
+```
+During a running test, per-stream process cleanup events are written here (since stdout belongs to the dashboard). The file is read and printed to the terminal after the dashboard exits, then deleted.
