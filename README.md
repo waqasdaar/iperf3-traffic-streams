@@ -9,7 +9,7 @@
 
 ---
 
-# Table of Contents
+## Table of Contents
 - [PRISM — Performance Real-time iPerf3 Stream Manager](#prism--performance-real-time-iperf3-stream-manager)
   - [Table of Contents](#table-of-contents)
   - [Introduction](#introduction)
