@@ -520,3 +520,38 @@ Requires **iperf3 ≥ 3.7** on both client and server. PRISM adds `--bidir` to t
 ```
 
 If critical fragmentation is detected, PRISM prompts before proceeding and recommends the MSS value to pass to iperf3 with `-M`.
+
+### Use Case 8 — FQDN Target with Automatic DNS Resolution
+
+**Scenario:** Test against a public iperf3 server using its hostname.
+
+```
+Menu:    3 — Client Mode
+Target:  iperf3.moji.fr
+```
+
+**PRISM** resolves the FQDN through a 6-method fallback chain and confirms the resolved IP before connecting:
+
+```
+Resolving iperf3.moji.fr... ✓ 163.172.189.215
+  → Target set: iperf3.moji.fr (163.172.189.215)
+```
+
+The dashboard renders a dedicated second line for the full FQDN to prevent truncation in the fixed-width target column:
+
+```
+1  TCP  ──────────────   5200   94.40 Mbps   ▅▆▇████   00:28  EF  CONNECTED
+         ↳ iperf3.moji.fr (163.172.189.215)
+```
+**DNS resolution chain**
+
+PRISM tries each resolver in order, stopping at the first success:
+
+| Priority |              Tool              |                       Notes                      |
+|:--------:|:------------------------------:|:------------------------------------------------:|
+| 1        | getent hosts                   | glibc resolver; respects /etc/hosts and nsswitch |
+| 2        | dig +short A                   | Precise; returns only A records                  |
+| 3        | host -t A                      | Available on Linux and macOS                     |
+| 4        | nslookup                       | Legacy; available almost everywhere              |
+| 5        | python3 socket.gethostbyname() | Uses system resolver stack                       |
+| 6        | python2 socket.gethostbyname() | Older system fallback                            |
