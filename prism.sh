@@ -27,6 +27,10 @@ _bootstrap_detect() {
 
 _bootstrap_detect
 
+CAP_DNS_COLOR=""
+CAP_DNS_RAW=""
+CAP_DNS_REASON=""
+
 # =============================================================================
 # ASSOCIATIVE ARRAY COMPATIBILITY LAYER
 # =============================================================================
@@ -1065,6 +1069,8 @@ declare -a MTP_PORTS=()      # per-class base ports
 declare -a MTP_DURATIONS=()  # per-class durations
 declare -a MTP_BINDS=()      # per-class bind IPs
 declare -a MTP_VRFS=()       # per-class VRFs
+
+declare -a S_TARGET_DISPLAY=()
 
 MTP_BASE_PORT=5201
 MTP_PORT_MODE="auto"
@@ -2365,6 +2371,28 @@ _check_capabilities() {
         CAP_MTP_RAW="$RAW_OFF"
         CAP_MTP_REASON="Requires iperf3 and awk in PATH"
     fi
+
+    # ------------------------------------------------------------------
+    # 7. DNS Resolution (FQDN support)
+    # ------------------------------------------------------------------
+    local _dns_tool=""
+    if   command -v getent  >/dev/null 2>&1; then _dns_tool="getent"
+    elif command -v dig     >/dev/null 2>&1; then _dns_tool="dig"
+    elif command -v host    >/dev/null 2>&1; then _dns_tool="host"
+    elif command -v nslookup>/dev/null 2>&1; then _dns_tool="nslookup"
+    elif command -v python3 >/dev/null 2>&1; then _dns_tool="python3"
+    elif command -v python2 >/dev/null 2>&1; then _dns_tool="python2"
+    fi
+
+    if [[ -n "$_dns_tool" ]]; then
+        CAP_DNS_COLOR="$(_cap_badge ok)"
+        CAP_DNS_RAW="$RAW_OK"
+        CAP_DNS_REASON="FQDN resolution via ${_dns_tool}"
+    else
+        CAP_DNS_COLOR="$(_cap_badge warn)"
+        CAP_DNS_RAW="$RAW_WARN"
+        CAP_DNS_REASON="No resolver found — IPv4 only (no getent/dig/host)"
+    fi
 }
 
 
@@ -2525,6 +2553,9 @@ _print_capability_matrix() {
 
     _cm_row "Mixed Traffic (MTP)" \
             "$CAP_MTP_COLOR"   "$CAP_MTP_RAW"   "$CAP_MTP_REASON"
+
+    _cm_row "FQDN Resolution"     \
+            "$CAP_DNS_COLOR"   "$CAP_DNS_RAW"   "$CAP_DNS_REASON"
 
     _cm_rule "+" "-" "+"
 
@@ -3470,6 +3501,356 @@ validate_ip() {
     return 1
 }
 
+# ==============================================================================
+# _resolve_fqdn  <hostname>
+#
+# Resolves a Fully Qualified Domain Name (FQDN) or short hostname to its
+# first IPv4 address using the best available resolver on the system.
+#
+# Resolution chain (tried in order until one succeeds):
+#   1. getent hosts       — glibc resolver, respects /etc/hosts + DNS
+#                           Available: Linux (glibc), not macOS
+#   2. dig +short A       — BIND dig utility, returns first A record
+#                           Available: Linux (bind-utils), macOS with bind
+#   3. host -t A          — host utility, part of bind-utils
+#                           Available: Linux, macOS
+#   4. nslookup           — legacy resolver, available almost everywhere
+#                           Available: Linux, macOS, minimal containers
+#   5. python3 socket     — Python fallback, uses system resolver
+#                           Available: wherever Python 3 is installed
+#   6. python2 socket     — Python 2 fallback
+#                           Available: older systems
+#
+# Returns:
+#   Prints the first resolved IPv4 address string (e.g. "93.184.216.34")
+#   Returns exit code 0 on success, 1 on failure.
+#
+# Does NOT print to stdout on failure — callers check exit code and
+# handle the error message themselves.
+# ==============================================================================
+_resolve_fqdn() {
+    local hostname="$1"
+    local resolved=""
+
+    # ------------------------------------------------------------------
+    # Method 1: getent hosts (Linux glibc — most reliable on Linux)
+    # getent respects /etc/hosts, /etc/nsswitch.conf, and DNS.
+    # Output format: "IP    hostname aliases..."
+    # We take the first field of the first matching line.
+    # ------------------------------------------------------------------
+    if command -v getent >/dev/null 2>&1; then
+        resolved=$(getent hosts "$hostname" 2>/dev/null \
+            | awk 'NR==1 {print $1}' \
+            | grep -E '^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$' \
+            | head -1)
+        if [[ -n "$resolved" ]]; then
+            printf '%s' "$resolved"
+            return 0
+        fi
+    fi
+
+    # ------------------------------------------------------------------
+    # Method 2: dig +short A (most precise — only returns A records)
+    # +short suppresses all decorative output.
+    # We filter to ensure we only accept dotted-quad IPv4.
+    # ------------------------------------------------------------------
+    if command -v dig >/dev/null 2>&1; then
+        resolved=$(dig +short A "$hostname" 2>/dev/null \
+            | grep -E '^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$' \
+            | head -1)
+        if [[ -n "$resolved" ]]; then
+            printf '%s' "$resolved"
+            return 0
+        fi
+    fi
+
+    # ------------------------------------------------------------------
+    # Method 3: host -t A (available on most Linux distros and macOS)
+    # Output format: "hostname has address IP"
+    # ------------------------------------------------------------------
+    if command -v host >/dev/null 2>&1; then
+        resolved=$(host -t A "$hostname" 2>/dev/null \
+            | grep -E 'has address' \
+            | awk '{print $NF}' \
+            | grep -E '^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$' \
+            | head -1)
+        if [[ -n "$resolved" ]]; then
+            printf '%s' "$resolved"
+            return 0
+        fi
+    fi
+
+    # ------------------------------------------------------------------
+    # Method 4: nslookup (legacy but universally available)
+    # Output format varies — we grep for "Address:" lines after the
+    # server section (skip the first Address: which is the DNS server).
+    # ------------------------------------------------------------------
+    if command -v nslookup >/dev/null 2>&1; then
+        resolved=$(nslookup "$hostname" 2>/dev/null \
+            | awk '/^Name:/{found=1} found && /^Address:/{print $2; exit}' \
+            | grep -E '^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$' \
+            | head -1)
+        if [[ -n "$resolved" ]]; then
+            printf '%s' "$resolved"
+            return 0
+        fi
+    fi
+
+    # ------------------------------------------------------------------
+    # Method 5: python3 socket.gethostbyname (portable Python fallback)
+    # Uses the system's native resolver stack.
+    # ------------------------------------------------------------------
+    if command -v python3 >/dev/null 2>&1; then
+        resolved=$(python3 -c \
+            "import socket; print(socket.gethostbyname('${hostname//\'/}'))" \
+            2>/dev/null \
+            | grep -E '^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$')
+        if [[ -n "$resolved" ]]; then
+            printf '%s' "$resolved"
+            return 0
+        fi
+    fi
+
+    # ------------------------------------------------------------------
+    # Method 6: python2 socket.gethostbyname (older system fallback)
+    # ------------------------------------------------------------------
+    if command -v python2 >/dev/null 2>&1; then
+        resolved=$(python2 -c \
+            "import socket; print socket.gethostbyname('${hostname//\'/}')" \
+            2>/dev/null \
+            | grep -E '^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$')
+        if [[ -n "$resolved" ]]; then
+            printf '%s' "$resolved"
+            return 0
+        fi
+    fi
+
+    # All methods failed
+    return 1
+}
+
+# ==============================================================================
+# _validate_and_resolve_target  <input>  <out_ip_var>  <out_display_var>
+#
+# Validates and resolves a target address entered by the operator.
+# Accepts both IPv4 addresses and FQDNs/hostnames.
+#
+# Parameters:
+#   $1  input           — raw operator input (IPv4 or FQDN)
+#   $2  out_ip_var      — name of variable to store the resolved IPv4
+#   $3  out_display_var — name of variable to store the display string
+#                         Format: "FQDN (IP)" for FQDNs, "IP" for plain IPv4
+#
+# Return codes:
+#   0  — valid and resolved, out_ip_var and out_display_var populated
+#   1  — invalid format or DNS resolution failed
+#   2  — resolved but address is reserved/non-routable (loopback etc.)
+#
+# Side effects:
+#   Prints informational messages to stdout during resolution.
+#   Does NOT prompt — caller handles all prompting.
+#
+# FQDN validation rules:
+#   - 1–253 characters total
+#   - Labels separated by dots
+#   - Each label: 1–63 chars, alphanumeric + hyphens, no leading/trailing hyphen
+#   - Must contain at least one dot (to distinguish from single-word hostnames)
+#     OR be a resolvable single-label name
+#   - Pure IPv4 inputs bypass DNS lookup entirely
+# ==============================================================================
+_validate_and_resolve_target() {
+    local input="$1"
+    local out_ip_var="$2"
+    local out_display_var="$3"
+
+    # ------------------------------------------------------------------
+    # Strip leading/trailing whitespace
+    # ------------------------------------------------------------------
+    input="${input#"${input%%[![:space:]]*}"}"
+    input="${input%"${input##*[![:space:]]}"}"
+
+    [[ -z "$input" ]] && return 1
+
+    # ------------------------------------------------------------------
+    # PATH A: Pure IPv4 address
+    # If it looks like an IPv4, validate it directly without DNS.
+    # ------------------------------------------------------------------
+    if [[ "$input" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]]; then
+        # Validate each octet
+        local o1 o2 o3 o4
+        IFS='.' read -r o1 o2 o3 o4 <<< "$input"
+        local octet_valid=1
+        local o
+        for o in "$o1" "$o2" "$o3" "$o4"; do
+            if [[ ! "$o" =~ ^[0-9]+$ ]] || (( 10#$o > 255 )); then
+                octet_valid=0
+                break
+            fi
+        done
+
+        if (( octet_valid == 0 )); then
+            return 1
+        fi
+
+        # Reserved address checks (same logic as before, factored out)
+        local _reserved=0
+        local _reserved_reason=""
+
+        if   (( 10#$o1 == 0 )); then
+            _reserved=1
+            _reserved_reason="0.0.0.0/8 is the 'this network' range (RFC 1122)"
+        elif (( 10#$o1 == 127 )); then
+            _reserved=1
+            _reserved_reason="127.0.0.0/8 is the loopback range — use Loopback Test mode instead"
+        elif (( 10#$o1 == 169 && 10#$o2 == 254 )); then
+            _reserved=1
+            _reserved_reason="169.254.0.0/16 is the link-local (APIPA) range (RFC 3927)"
+        elif (( 10#$o1 == 192 && 10#$o2 == 0 && 10#$o3 == 2 )); then
+            _reserved=1
+            _reserved_reason="192.0.2.0/24 is TEST-NET-1 (RFC 5737)"
+        elif (( 10#$o1 == 198 && 10#$o2 == 51 && 10#$o3 == 100 )); then
+            _reserved=1
+            _reserved_reason="198.51.100.0/24 is TEST-NET-2 (RFC 5737)"
+        elif (( 10#$o1 == 203 && 10#$o2 == 0 && 10#$o3 == 113 )); then
+            _reserved=1
+            _reserved_reason="203.0.113.0/24 is TEST-NET-3 (RFC 5737)"
+        elif (( 10#$o1 == 198 && ( 10#$o2 == 18 || 10#$o2 == 19 ) )); then
+            _reserved=1
+            _reserved_reason="198.18.0.0/15 is the benchmarking range (RFC 2544)"
+        elif (( 10#$o1 >= 224 && 10#$o1 <= 239 )); then
+            _reserved=1
+            _reserved_reason="${input} is in the multicast range (224.0.0.0/4)"
+        elif (( 10#$o1 >= 240 && 10#$o1 <= 254 )); then
+            _reserved=1
+            _reserved_reason="${input} is in the reserved range (240.0.0.0/4)"
+        elif (( 10#$o1 == 255 )); then
+            _reserved=1
+            _reserved_reason="255.x.x.x is a broadcast/reserved range"
+        elif (( 10#$o4 == 0 )); then
+            _reserved=1
+            _reserved_reason="${input} ends in .0 — typically a network address"
+        elif (( 10#$o4 == 255 )); then
+            _reserved=1
+            _reserved_reason="${input} ends in .255 — typically a broadcast address"
+        fi
+
+        if (( _reserved )); then
+            printf '%b  Reason: %s.%b\n' "$YELLOW" "$_reserved_reason" "$NC"
+            # Write to out vars anyway so caller can display the error
+            printf -v "$out_ip_var"      '%s' "$input"
+            printf -v "$out_display_var" '%s' "$input"
+            return 2
+        fi
+
+        # Valid unicast IPv4
+        printf -v "$out_ip_var"      '%s' "$input"
+        printf -v "$out_display_var" '%s' "$input"
+        return 0
+    fi
+
+    # ------------------------------------------------------------------
+    # PATH B: FQDN / Hostname
+    # Validate the syntax before attempting DNS resolution.
+    # ------------------------------------------------------------------
+
+    # Basic FQDN syntax validation:
+    #   - Total length 1-253 characters
+    #   - Each label: 1-63 chars, [A-Za-z0-9-], no leading/trailing hyphen
+    #   - At least one dot separating labels OR resolvable single label
+
+    local fqdn_valid=1
+
+    # Length check
+    if (( ${#input} == 0 || ${#input} > 253 )); then
+        fqdn_valid=0
+    fi
+
+    # Character set check — allow alphanumeric, hyphen, dot
+    # Reject anything containing characters outside [A-Za-z0-9.-]
+    if [[ $fqdn_valid -eq 1 ]]; then
+        if [[ ! "$input" =~ ^[A-Za-z0-9]([A-Za-z0-9._-]*[A-Za-z0-9])?$ ]]; then
+            fqdn_valid=0
+        fi
+    fi
+
+    # Per-label validation (each label between dots must be 1-63 chars,
+    # must not start or end with a hyphen)
+    if [[ $fqdn_valid -eq 1 ]]; then
+        local IFS_SAVE="$IFS"
+        IFS='.'
+        local -a labels
+        read -ra labels <<< "$input"
+        IFS="$IFS_SAVE"
+
+        local label
+        for label in "${labels[@]}"; do
+            if (( ${#label} == 0 || ${#label} > 63 )); then
+                fqdn_valid=0
+                break
+            fi
+            # No leading or trailing hyphen
+            if [[ "$label" =~ ^- || "$label" =~ -$ ]]; then
+                fqdn_valid=0
+                break
+            fi
+        done
+    fi
+
+    if (( fqdn_valid == 0 )); then
+        return 1
+    fi
+
+    # ------------------------------------------------------------------
+    # DNS Resolution
+    # ------------------------------------------------------------------
+    printf '  %bResolving %b%s%b...' "$DIM" "$BOLD" "$input" "$NC"
+
+    local resolved_ip
+    if resolved_ip=$(_resolve_fqdn "$input"); then
+        printf ' %b✓ %s%b\n' "$GREEN" "$resolved_ip" "$NC"
+
+        # Validate the resolved IP is a usable unicast address
+        # (re-use PATH A logic by recursing with the IP)
+        local _check_ip _check_disp
+        local rc
+        _validate_and_resolve_target "$resolved_ip" "_check_ip" "_check_disp"
+        rc=$?
+
+        if (( rc == 2 )); then
+            # Reserved address returned from DNS (e.g. RFC 5737 test range)
+            printf '%b  DNS resolved to reserved address %s — cannot use.%b\n' \
+                "$RED" "$resolved_ip" "$NC"
+            return 2
+        fi
+
+        if (( rc != 0 )); then
+            printf '%b  DNS resolved to invalid address %s.%b\n' \
+                "$RED" "$resolved_ip" "$NC"
+            return 1
+        fi
+
+        # Loopback special case — redirect to loopback mode
+        local _r1
+        _r1="${resolved_ip%%.*}"
+        if (( 10#$_r1 == 127 )); then
+            printf '%b  %s resolves to loopback (%s).%b\n' \
+                "$YELLOW" "$input" "$resolved_ip" "$NC"
+            printf '%b  Use Loopback Test mode (option 4) for local tests.%b\n' \
+                "$YELLOW" "$NC"
+            return 2
+        fi
+
+        # Success — store resolved IP and display string
+        printf -v "$out_ip_var"      '%s' "$resolved_ip"
+        printf -v "$out_display_var" '%s' "${input} (${resolved_ip})"
+        return 0
+    else
+        printf ' %bFAILED%b\n' "$RED" "$NC"
+        printf '  %bCould not resolve "%s" — check spelling and DNS configuration.%b\n' \
+            "$RED" "$input" "$NC"
+        return 1
+    fi
+}
 
 # ---------------------------------------------------------------------------
 # _all_streams_loopback
@@ -4766,132 +5147,57 @@ configure_client_streams() {
 
         local tprompt
         [[ -n "$lt" ]] \
-            && tprompt="  Target server IP/hostname [$lt]" \
-            || tprompt="  Target server IP/hostname"
-        local tgt
+            && tprompt="  Target server IP or FQDN [$lt]" \
+            || tprompt="  Target server IP or FQDN"
+        local tgt tgt_display
         while true; do
             read -r -p "${tprompt}: " tgt </dev/tty
             tgt="${tgt:-$lt}"
 
-            # ── Empty input ───────────────────────────────────────────────────
+            # ── Empty input ───────────────────────────────────────────────
             if [[ -z "$tgt" ]]; then
-                printf '%b\n' "${RED}  Target is required. Enter a valid IP address.${NC}"
+                printf '%b\n' "${RED}  Target is required. Enter an IPv4 address or FQDN.${NC}"
                 continue
             fi
 
-            # ── Must be a valid IP address ────────────────────────────────────
-            # Hostnames are no longer accepted silently with a warning.
-            # The target must be a syntactically valid IPv4 address.
-            if ! validate_ip "$tgt"; then
-                printf '%b\n' \
-                    "${RED}  '${tgt}' is not a valid IPv4 address.${NC}"
-                printf '%b\n' \
-                    "${RED}  Enter a valid IP address (e.g. 192.168.1.10).${NC}"
-                continue
-            fi
+            # ── Validate and resolve (IPv4 or FQDN) ──────────────────────
+            local _resolved_ip _resolved_display
+            local _resolve_rc
+            _validate_and_resolve_target "$tgt" "_resolved_ip" "_resolved_display"
+            _resolve_rc=$?
 
-            # ── Reserved / non-routable address check ─────────────────────────
-            # Reject addresses that are reserved, unspecified, broadcast,
-            # or otherwise not valid unicast destinations:
-            #
-            #   0.x.x.x          "This network" — RFC 1122
-            #   127.x.x.x        Loopback — allowed only in loopback test mode
-            #   169.254.x.x      Link-local (APIPA) — RFC 3927
-            #   192.0.2.x        TEST-NET-1 — RFC 5737
-            #   198.51.100.x     TEST-NET-2 — RFC 5737
-            #   203.0.113.x      TEST-NET-3 — RFC 5737
-            #   198.18.x.x /
-            #   198.19.x.x       Benchmarking — RFC 2544
-            #   240.x.x.x        Reserved — RFC 1112
-            #   255.x.x.x        Broadcast / reserved
-            #   x.x.x.0          Network address (last octet = 0)
-            #   x.x.x.255        Broadcast address (last octet = 255)
-            #
-            # Private RFC 1918 ranges (10.x, 172.16-31.x, 192.168.x) ARE
-            # allowed — they are valid unicast targets in enterprise networks.
-            # Multicast (224-239.x.x.x) is rejected — not a valid iperf3 target.
-
-            local _o1 _o2 _o3 _o4
-            IFS='.' read -r _o1 _o2 _o3 _o4 <<< "$tgt"
-            local _reserved=0
-            local _reserved_reason=""
-
-            # 0.x.x.x — "this network"
-            if (( 10#$_o1 == 0 )); then
-                _reserved=1
-                _reserved_reason="0.0.0.0/8 is the 'this network' range (RFC 1122)"
-
-            # 127.x.x.x — loopback
-            elif (( 10#$_o1 == 127 )); then
-                _reserved=1
-                _reserved_reason="127.0.0.0/8 is the loopback range — use Loopback Test mode (menu option 4) instead"
-
-            # 169.254.x.x — link-local
-            elif (( 10#$_o1 == 169 && 10#$_o2 == 254 )); then
-                _reserved=1
-                _reserved_reason="169.254.0.0/16 is the link-local (APIPA) range (RFC 3927)"
-
-            # 192.0.2.x — TEST-NET-1
-            elif (( 10#$_o1 == 192 && 10#$_o2 == 0 && 10#$_o3 == 2 )); then
-                _reserved=1
-                _reserved_reason="192.0.2.0/24 is TEST-NET-1 — documentation range (RFC 5737)"
-
-            # 198.51.100.x — TEST-NET-2
-            elif (( 10#$_o1 == 198 && 10#$_o2 == 51 && 10#$_o3 == 100 )); then
-                _reserved=1
-                _reserved_reason="198.51.100.0/24 is TEST-NET-2 — documentation range (RFC 5737)"
-
-            # 203.0.113.x — TEST-NET-3
-            elif (( 10#$_o1 == 203 && 10#$_o2 == 0 && 10#$_o3 == 113 )); then
-                _reserved=1
-                _reserved_reason="203.0.113.0/24 is TEST-NET-3 — documentation range (RFC 5737)"
-
-            # 198.18.x.x and 198.19.x.x — benchmarking
-            elif (( 10#$_o1 == 198 && ( 10#$_o2 == 18 || 10#$_o2 == 19 ) )); then
-                _reserved=1
-                _reserved_reason="198.18.0.0/15 is the benchmarking range (RFC 2544)"
-
-            # 224-239.x.x.x — multicast
-            elif (( 10#$_o1 >= 224 && 10#$_o1 <= 239 )); then
-                _reserved=1
-                _reserved_reason="${tgt} is in the multicast range (224.0.0.0/4) — not a valid iperf3 target"
-
-            # 240-254.x.x.x — reserved
-            elif (( 10#$_o1 >= 240 && 10#$_o1 <= 254 )); then
-                _reserved=1
-                _reserved_reason="${tgt} is in the reserved range (240.0.0.0/4 — RFC 1112)"
-
-            # 255.x.x.x — broadcast / reserved
-            elif (( 10#$_o1 == 255 )); then
-                _reserved=1
-                _reserved_reason="255.x.x.x is a broadcast/reserved range"
-
-            # x.x.x.0 — network address (last octet 0)
-            elif (( 10#$_o4 == 0 )); then
-                _reserved=1
-                _reserved_reason="${tgt} ends in .0 — this is typically a network address, not a host"
-
-            # x.x.x.255 — broadcast address (last octet 255)
-            elif (( 10#$_o4 == 255 )); then
-                _reserved=1
-                _reserved_reason="${tgt} ends in .255 — this is typically a broadcast address, not a host"
-            fi
-
-            if (( _reserved )); then
-                printf '%b\n' \
-                    "${RED}  '${tgt}' is not a valid target address.${NC}"
-                printf '%b\n' \
-                    "${RED}  Reason: ${_reserved_reason}.${NC}"
-                printf '%b\n' \
-                    "${RED}  Enter a valid unicast IP address.${NC}"
-                continue
-            fi
-
-            # ── Valid IP accepted ─────────────────────────────────────────────
-            break
+            case $_resolve_rc in
+                0)
+                    # Valid and usable
+                    tgt_display="$_resolved_display"
+                    tgt="$_resolved_ip"
+                    printf '  %b✓ Target set: %b%s%b\n' \
+                        "$GREEN" "$BOLD" "$tgt_display" "$NC"
+                    break
+                    ;;
+                1)
+                    # Invalid format or DNS failed
+                    printf '%b\n' \
+                        "${RED}  '${tgt}' is not a valid IPv4 address or resolvable FQDN.${NC}"
+                    printf '%b\n' \
+                        "${RED}  Examples: 192.168.1.10  iperf3.moji.fr  my-server.example.com${NC}"
+                    continue
+                    ;;
+                2)
+                    # Reserved or loopback — already printed reason
+                    printf '%b\n' \
+                        "${RED}  Enter a valid unicast IP address or FQDN.${NC}"
+                    continue
+                    ;;
+            esac
         done
+
         lt="$tgt"
         S_TARGET+=("$tgt")
+        S_TARGET_DISPLAY+=("$tgt_display")
+
+        # Store display name for use in stream summary and dashboard
+        # The internal target is always the resolved IPv4
 
         local dp=$(( lp + 1 )) port
         while true; do
@@ -5554,36 +5860,166 @@ configure_server_streams() {
     SERVER_COUNT="$num"
 }
 
+# ==============================================================================
+# show_stream_summary  <mode>
+#
+# Displays a formatted pre-launch summary of all configured streams or
+# server listeners inside the standard PRISM box style.
+#
+# Parameters:
+#   $1  mode  — "client" (default) | "server"
+#
+# CLIENT MODE columns:
+#   # | Proto | Target (FQDN or IP) | Port | Bandwidth | Dur | DSCP | VRF
+#   Followed by optional annotation lines:
+#     - TCP options   (CCA, Window, MSS)
+#     - Flags         ([REV], P:N parallel)
+#     - Network impairment  (delay, loss — Linux only)
+#     - Bidir         [BIDIR TX+RX]
+#     - Ramp profile  (ramp up/hold/down durations)
+#
+# SERVER MODE columns:
+#   # | Port | Bind IP | VRF | 1-off
+#
+# FQDN DISPLAY:
+#   When S_TARGET_DISPLAY[$i] is set (operator entered an FQDN that was
+#   resolved to an IPv4), the Target column shows:
+#     "iperf3.moji.fr (93.184.216.34)"
+#   truncated to fit the column width with a trailing ~ if needed.
+#   When no display override exists, the raw S_TARGET[$i] IPv4 is shown.
+#
+# ALIGNMENT:
+#   All column widths are fixed constants so the table always aligns
+#   cleanly regardless of input length.  Long values are truncated with
+#   a trailing ~ character.
+#
+# CALLED BY:
+#   run_client_mode, run_server_mode, run_loopback_mode,
+#   run_mixed_traffic_mode (after stream configuration, before launch).
+# ==============================================================================
 show_stream_summary() {
     local mode="${1:-client}"
+
     echo ""
     print_header "Stream Configuration Summary"
     _print_session_header
     echo ""
+
+    # ------------------------------------------------------------------
+    # CLIENT MODE
+    # ------------------------------------------------------------------
     if [[ "$mode" == "client" ]]; then
-        printf '  %-3s  %-5s  %-18s  %-6s  %-10s  %-5s  %-5s  %-10s\n' \
-            "#" "Proto" "Target" "Port" "Bandwidth" "Dur" "DSCP" "VRF"
-        printf '  %s\n' "$(rpt '-' 72)"
+
+        # ── Column widths ─────────────────────────────────────────────
+        local C_SN=3       # stream number   "  1"
+        local C_PROTO=5    # protocol        "TCP  "
+        local C_TGT=22     # target          "iperf3.moji.fr (93.18~"
+        local C_PORT=6     # port            " 5201 "
+        local C_BW=11      # bandwidth       "unlimited  "
+        local C_DUR=5      # duration        "10s  "
+        local C_DSCP=5     # DSCP name       "EF   "
+        local C_VRF=10     # VRF             "GRT       "
+
+        # ── Column header ─────────────────────────────────────────────
+        printf '  %-*s  %-*s  %-*s  %*s  %-*s  %-*s  %-*s  %-*s\n' \
+            "$C_SN"    "#" \
+            "$C_PROTO" "Proto" \
+            "$C_TGT"   "Target" \
+            "$C_PORT"  "Port" \
+            "$C_BW"    "Bandwidth" \
+            "$C_DUR"   "Dur" \
+            "$C_DSCP"  "DSCP" \
+            "$C_VRF"   "VRF"
+
+        # Separator line spans all columns
+        local _sep_len=$(( C_SN + 2 + C_PROTO + 2 + C_TGT + 2 + \
+                           C_PORT + 2 + C_BW + 2 + C_DUR + 2 + \
+                           C_DSCP + 2 + C_VRF ))
+        printf '  %s\n' "$(rpt '-' $_sep_len)"
+
+        # ── Data rows ─────────────────────────────────────────────────
         local i
         for (( i=0; i<STREAM_COUNT; i++ )); do
-            local dd; (( S_DURATION[$i] == 0 )) && dd="inf" || dd="${S_DURATION[$i]}s"
-            local vrf_disp="${S_VRF[$i]:-GRT}"; [[ "$OS_TYPE" == "macos" ]] && vrf_disp="N/A"
-            printf '  %-3d  %-5s  %-18s  %-6s  %-10s  %-5s  %-5s  %-10s\n' \
-                "$((i+1))" "${S_PROTO[$i]}" "${S_TARGET[$i]}" "${S_PORT[$i]}" \
-                "${S_BW[$i]:-unlimited}" "$dd" "${S_DSCP_NAME[$i]:-none}" "$vrf_disp"
+            local sn=$(( i + 1 ))
+
+            # Duration display
+            local dd
+            (( S_DURATION[$i] == 0 )) && dd="inf" || dd="${S_DURATION[$i]}s"
+
+            # VRF display
+            local vrf_disp="${S_VRF[$i]:-GRT}"
+            [[ "$OS_TYPE" == "macos" ]] && vrf_disp="N/A"
+
+            # Target display — prefer FQDN display name when available.
+            # S_TARGET_DISPLAY[$i] is populated by configure_client_streams
+            # when the operator entered an FQDN that resolved to an IPv4.
+            # Format: "iperf3.moji.fr (93.184.216.34)"
+            # Falls back to the raw IPv4 stored in S_TARGET[$i].
+            local tgt_show="${S_TARGET_DISPLAY[$i]:-${S_TARGET[$i]:-?}}"
+
+            # Truncate target to column width — append ~ if truncated
+            if (( ${#tgt_show} > C_TGT )); then
+                tgt_show="${tgt_show:0:$(( C_TGT - 1 ))}~"
+            fi
+
+            # Bandwidth display
+            local bw_show="${S_BW[$i]:-unlimited}"
+            if (( ${#bw_show} > C_BW )); then
+                bw_show="${bw_show:0:$(( C_BW - 1 ))}~"
+            fi
+
+            # DSCP display
+            local dscp_show="${S_DSCP_NAME[$i]:-none}"
+            if (( ${#dscp_show} > C_DSCP )); then
+                dscp_show="${dscp_show:0:$(( C_DSCP - 1 ))}~"
+            fi
+
+            # VRF truncation
+            if (( ${#vrf_disp} > C_VRF )); then
+                vrf_disp="${vrf_disp:0:$(( C_VRF - 1 ))}~"
+            fi
+
+            # ── Main row ──────────────────────────────────────────────
+            printf '  %-*s  %-*s  %-*s  %*s  %-*s  %-*s  %-*s  %-*s\n' \
+                "$C_SN"    "$sn" \
+                "$C_PROTO" "${S_PROTO[$i]}" \
+                "$C_TGT"   "$tgt_show" \
+                "$C_PORT"  "${S_PORT[$i]}" \
+                "$C_BW"    "$bw_show" \
+                "$C_DUR"   "$dd" \
+                "$C_DSCP"  "$dscp_show" \
+                "$C_VRF"   "$vrf_disp"
+
+            # ── Annotation lines ──────────────────────────────────────
+            # Each annotation is printed indented under the main row.
+            # We accumulate flags into $ex and print once at the end.
             local ex=""
+
+            # TCP-specific options
             [[ -n "${S_CCA[$i]}"    ]] && ex+=" CCA:${S_CCA[$i]}"
             [[ -n "${S_WINDOW[$i]}" ]] && ex+=" Win:${S_WINDOW[$i]}"
             [[ -n "${S_MSS[$i]}"    ]] && ex+=" MSS:${S_MSS[$i]}"
-            (( S_REVERSE[$i]  == 1  )) && ex+=" [REV]"
-            (( S_PARALLEL[$i] >  1  )) && ex+=" P:${S_PARALLEL[$i]}"
+
+            # Flags
+            (( S_REVERSE[$i]  == 1 )) && ex+=" [REV]"
+            (( S_PARALLEL[$i] >  1 )) && ex+=" P:${S_PARALLEL[$i]}"
+
+            # Network impairment (Linux only — not available on macOS)
             if [[ "$OS_TYPE" == "linux" ]]; then
-                [[ -n "${S_DELAY[$i]}" ]] && ex+=" delay:${S_DELAY[$i]}ms"
-                [[ -n "${S_LOSS[$i]}"  ]] && ex+=" loss:${S_LOSS[$i]}%"
+                [[ -n "${S_DELAY[$i]}"  ]] && ex+=" delay:${S_DELAY[$i]}ms"
+                [[ -n "${S_JITTER[$i]}" ]] && ex+=" jitter:${S_JITTER[$i]}ms"
+                [[ -n "${S_LOSS[$i]}"   ]] && ex+=" loss:${S_LOSS[$i]}%"
             fi
-            [[ "${S_BIDIR[$i]:-0}" == "1" ]] && ex+=" ${GREEN}[BIDIR TX+RX]${NC}"
-            [[ -n "$ex" ]] && printf '%b    %s%b\n' "$CYAN" "$ex" "$NC"
-            # Ramp profile annotation
+
+            # Bidirectional mode
+            [[ "${S_BIDIR[$i]:-0}" == "1" ]] && \
+                ex+=" ${GREEN}[BIDIR TX+RX]${NC}"
+
+            # Print accumulated TCP / flag annotations
+            [[ -n "$ex" ]] && \
+                printf '%b    %s%b\n' "$CYAN" "$ex" "$NC"
+
+            # Ramp profile annotation (separate line for readability)
             if [[ "${S_RAMP_ENABLED[$i]:-0}" == "1" ]]; then
                 printf '%b    ramp: +%ds ↑  hold  %ds ↓  (target: %s)%b\n' \
                     "$CYAN" \
@@ -5592,20 +6028,82 @@ show_stream_summary() {
                     "${S_BW[$i]:-unlimited}" \
                     "$NC"
             fi
+
+            # FQDN annotation — when a hostname was resolved, show the
+            # full untruncated mapping on a dedicated line so the operator
+            # can confirm the correct IP is being used even when the
+            # display string was truncated in the main row.
+            if [[ -n "${S_TARGET_DISPLAY[$i]:-}" && \
+                  "${S_TARGET_DISPLAY[$i]}" != "${S_TARGET[$i]:-}" ]]; then
+                printf '%b    resolved: %s → %s%b\n' \
+                    "$DIM" \
+                    "${S_TARGET_DISPLAY[$i]%% (*}" \
+                    "${S_TARGET[$i]}" \
+                    "$NC"
+            fi
         done
-        printf '  %s\n' "$(rpt '-' 72)"
+
+        # ── Footer separator ─────────────────────────────────────────
+        printf '  %s\n' "$(rpt '-' $_sep_len)"
+
+    # ------------------------------------------------------------------
+    # SERVER MODE
+    # ------------------------------------------------------------------
     else
-        printf '  %-3s  %-7s  %-18s  %-12s  %-6s\n' "#" "Port" "Bind IP" "VRF" "1-off"
-        printf '  %s\n' "$(rpt '-' 52)"
+
+        # ── Column widths ─────────────────────────────────────────────
+        local C_SN=3       # listener number
+        local C_PORT=7     # port
+        local C_BIND=18    # bind IP
+        local C_VRF=12     # VRF
+        local C_ONEOFF=6   # one-off flag
+
+        # ── Column header ─────────────────────────────────────────────
+        printf '  %-*s  %*s  %-*s  %-*s  %-*s\n' \
+            "$C_SN"     "#" \
+            "$C_PORT"   "Port" \
+            "$C_BIND"   "Bind IP" \
+            "$C_VRF"    "VRF" \
+            "$C_ONEOFF" "1-off"
+
+        local _srv_sep=$(( C_SN + 2 + C_PORT + 2 + C_BIND + 2 + \
+                           C_VRF + 2 + C_ONEOFF ))
+        printf '  %s\n' "$(rpt '-' $_srv_sep)"
+
+        # ── Data rows ─────────────────────────────────────────────────
         local i
         for (( i=0; i<SERVER_COUNT; i++ )); do
-            local oo="no"; (( SRV_ONEOFF[$i] )) && oo="yes"
-            local vrf_disp="${SRV_VRF[$i]:-GRT}"; [[ "$OS_TYPE" == "macos" ]] && vrf_disp="N/A"
-            printf '  %-3d  %-7s  %-18s  %-12s  %-6s\n' \
-                "$((i+1))" "${SRV_PORT[$i]}" "${SRV_BIND[$i]:-0.0.0.0}" "$vrf_disp" "$oo"
+            local sn=$(( i + 1 ))
+            local oo="no"
+            (( SRV_ONEOFF[$i] )) && oo="yes"
+
+            local vrf_disp="${SRV_VRF[$i]:-GRT}"
+            [[ "$OS_TYPE" == "macos" ]] && vrf_disp="N/A"
+
+            local bind_disp="${SRV_BIND[$i]:-0.0.0.0}"
+
+            # Truncate long fields
+            if (( ${#bind_disp} > C_BIND )); then
+                bind_disp="${bind_disp:0:$(( C_BIND - 1 ))}~"
+            fi
+            if (( ${#vrf_disp} > C_VRF )); then
+                vrf_disp="${vrf_disp:0:$(( C_VRF - 1 ))}~"
+            fi
+
+            printf '  %-*s  %*s  %-*s  %-*s  %-*s\n' \
+                "$C_SN"     "$sn" \
+                "$C_PORT"   "${SRV_PORT[$i]}" \
+                "$C_BIND"   "$bind_disp" \
+                "$C_VRF"    "$vrf_disp" \
+                "$C_ONEOFF" "$oo"
         done
-        printf '  %s\n' "$(rpt '-' 52)"
-    fi; echo ""
+
+        # ── Footer separator ─────────────────────────────────────────
+        printf '  %s\n' "$(rpt '-' $_srv_sep)"
+
+    fi
+
+    echo ""
 }
 
 # =============================================================================
@@ -11755,20 +12253,43 @@ _mtp_configure_targets() {
             "$CYAN" "$(( ci + 1 ))" "$clabel" "$cproto" "$cpct" "$NC"
         printf '+%s+\n' "$(rpt '-' $inner)"
 
-        # Target IP
-        local tgt_prompt="  Target IP"
+        # Target IP or FQDN
+        local tgt_prompt="  Target IP or FQDN"
         [[ -n "$last_target" ]] && \
-            tgt_prompt="  Target IP [${last_target}]"
-        local tgt
+            tgt_prompt="  Target IP or FQDN [${last_target}]"
+        local tgt tgt_display
         while true; do
             read -r -p "${tgt_prompt}: " tgt </dev/tty
             tgt="${tgt:-$last_target}"
             [[ -z "$tgt" ]] && {
-                printf '%b  Target IP is required.%b\n' "$RED" "$NC"
+                printf '%b  Target is required.%b\n' "$RED" "$NC"
                 continue
             }
-            validate_ip "$tgt" && break
-            printf '%b  Invalid IP address.%b\n' "$RED" "$NC"
+
+            local _resolved_ip _resolved_display
+            local _resolve_rc
+            _validate_and_resolve_target "$tgt" "_resolved_ip" "_resolved_display"
+            _resolve_rc=$?
+
+            case $_resolve_rc in
+                0)
+                    tgt="$_resolved_ip"
+                    tgt_display="$_resolved_display"
+                    printf '  %b✓ Target set: %b%s%b\n' \
+                        "$GREEN" "$BOLD" "$tgt_display" "$NC"
+                    break
+                    ;;
+                1)
+                    printf '%b  Invalid address or unresolvable FQDN: "%s"%b\n' \
+                        "$RED" "$tgt" "$NC"
+                    continue
+                    ;;
+                2)
+                    printf '%b  Enter a valid unicast target.%b\n' \
+                        "$RED" "$NC"
+                    continue
+                    ;;
+            esac
         done
         last_target="$tgt"
 
@@ -13555,6 +14076,7 @@ main_menu() {
                 S_RAMP_BW_CURRENT=(); S_RAMP_BW_TARGET=()
                 S_RAMP_IFACE=();   S_RAMP_TC_ACTIVE=()
                 S_RAMP_TIMELINE_SNAPSHOT=()
+                S_TARGET_DISPLAY=()
                 if (( BASH_MAJOR >= 4 )); then
                     PMTU_RESULTS=(); PMTU_STATUS=(); PMTU_RECOMMEND=()
                 fi
@@ -13595,6 +14117,7 @@ main_menu() {
                 S_RAMP_BW_CURRENT=(); S_RAMP_BW_TARGET=()
                 S_RAMP_IFACE=();   S_RAMP_TC_ACTIVE=()
                 S_RAMP_TIMELINE_SNAPSHOT=()
+                S_TARGET_DISPLAY=()
                 JSON_EXPORT_ENABLED=0
                 JSON_EXPORT_FILES=()
                 # Also clear any leftover sample buffers
@@ -13629,6 +14152,7 @@ main_menu() {
                 S_RAMP_IFACE=();   S_RAMP_TC_ACTIVE=()
                 S_BIDIR=()
                 S_RAMP_TIMELINE_SNAPSHOT=()
+                S_TARGET_DISPLAY=()
                 MTP_BASE_PORT=5201
                 MTP_PORT_MODE="auto"
                 if (( BASH_MAJOR >= 4 )); then
