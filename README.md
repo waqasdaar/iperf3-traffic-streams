@@ -356,3 +356,46 @@ Bidir:      No
 * TCP CWND curve showing congestion window growth over time
 * Final sender and receiver bandwidth summary
 * JSON export file with per-second bandwidth samples
+
+### Use Case 2 — VoIP / RTP Quality Simulation (UDP EF)
+
+**Scenario:** Simulate a G.711 VoIP RTP stream and verify that the DSCP EF marking is preserved end-to-end through the network.
+
+```
+Menu:       3 — Client Mode
+Streams:    1
+Protocol:   UDP
+Target:     10.0.0.1
+Port:       5004
+Bandwidth:  1M
+Duration:   60
+DSCP:       EF
+```
+After the stream starts, press **`v`** in the dashboard to open the DSCP verification overlay. PRISM captures 50 packets via tcpdump and confirms that the IP TOS byte is `0xb8` (DSCP 46 × 4 = 184 = 0xb8):
+
+```
++==============================================================================+
+|              DSCP Marking Verification — Stream 1                            |
++------------------------------------------------------------------------------+
+| Pkt  Source IP:Port          Destination IP:Port     TOS     Got  Exp  Result|
+|------|----------------------|----------------------|--------|-----|----|----- |
+|  1   10.0.0.2:54321         10.0.0.1:5004          0xb8     46   46  PASS   |
+|  2   10.0.0.2:54321         10.0.0.1:5004          0xb8     46   46  PASS   |
++------------------------------------------------------------------------------+
+|  Summary:  50 packets  |  50 PASS  |  0 FAIL                                 |
+|  Verdict:  PASS — DSCP marking verified correct on stream 1                  |
++==============================================================================+
+```
+### Use Case 3 — Multi-Stream QoS Differentiation
+
+**Scenario:** Simultaneously send traffic across four QoS classes to verify that a QoS policy correctly prioritises real-time traffic over bulk data under congestion.
+```
+Menu:     3 — Client Mode
+Streams:  4
+
+Stream 1:  UDP · EF   · 1M    · "VoIP voice"
+Stream 2:  UDP · AF41 · 4M    · "Video conferencing"
+Stream 3:  TCP · AF21 · 0     · "Business data (unlimited)"
+Stream 4:  TCP · CS1  · 0     · "Background backup (unlimited)"
+```
+The live dashboard displays all four streams simultaneously with individual bandwidth readings, sparklines, RTT rows, CWND rows (for TCP streams), and DSCP labels. The final results table shows sender and receiver bandwidth for each class side by side.
