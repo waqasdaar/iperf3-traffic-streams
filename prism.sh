@@ -2,7 +2,7 @@
 # =============================================================================
 # PRISM — Performance Real-time iPerf3 Stream Manager
 # Enterprise-grade multi-stream traffic orchestration with live QoS dashboard
-# Version: 8.3.9
+# Version: 8.3.9.
 # Author : Waqas Daar (waqasdaar@gmail.com)
 # =============================================================================
 
