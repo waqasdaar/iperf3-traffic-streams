@@ -9973,6 +9973,7 @@ _render_completed_panel() {
     (( _tgt_max < 14 )) && _tgt_max=14
     (( _tgt_col_w > _tgt_max )) && _tgt_col_w=$_tgt_max
 
+    printf "\n\n"
     printf '+%s+\033[K\n' "$(rpt '=' $(( COLS - 2 )))"
     bcenter "${BOLD}${CYAN}Completed Streams${NC}"
     printf '+%s+\033[K\n' "$(rpt '=' $(( COLS - 2 )))"
@@ -10487,16 +10488,17 @@ _render_client_frame() {
         fi
         (( ${#dscp_disp} > C_DSCP )) && dscp_disp="${dscp_disp:0:$(( C_DSCP-1 ))}~"
 
-        # ── Status colour ─────────────────────────────────────────────────
+        # ── Status colour and label ───────────────────────────────────────
         local sb sc
         case "$st" in
             CONNECTED)  sb="CONNECTED"  sc="$GREEN"  ;;
-            CONNECTING) sb="CONNECTING" sc="$YELLOW" ;;
-            STARTING)   sb="STARTING"   sc="$YELLOW" ;;
-            DONE)       sb="DONE"       sc="$CYAN"   ;;
-            FAILED)     sb="FAILED"     sc="$RED"    ;;
+            CONNECTING) sb="Connecting" sc="$YELLOW" ;;
+            STARTING)   sb="Starting…"  sc="$YELLOW" ;;
+            DONE)       sb="Done"       sc="$CYAN"   ;;
+            FAILED)     sb="Failed"     sc="$RED"    ;;
             *)          sb="$st"        sc="$NC"     ;;
         esac
+
 
         # ── Truncate bandwidth fields ─────────────────────────────────────
         local bw_tx_disp="$bw_tx"
@@ -10505,37 +10507,32 @@ _render_client_frame() {
         (( ${#bw_rx_disp} > C_BW )) && bw_rx_disp="${bw_rx_disp:0:$(( C_BW-1 ))}~"
 
         # ── Target column decision ────────────────────────────────────────
-        # Get the full display string: "FQDN (IP)" or plain "IP"
         local tgt_raw="${S_TARGET[$i]:-?}"
-        local tgt_full="${S_TARGET_DISPLAY[$i]:-$tgt_raw}"
+        local tgt_disp="${S_TARGET_DISPLAY[$i]:-$tgt_raw}"
 
-        # Decide what to show in the C_TARGET-wide column:
-        #   • If the full string fits in C_TARGET chars  → show it inline
-        #   • If it does not fit but the raw IP fits     → show raw IP inline
-        #     and print an FQDN line below
-        #   • If nothing fits                            → truncate raw IP
-        local tgt_col           # what goes in the main row column
-        local _use_target_line=0  # 1 = print a dedicated "↳" line below
+        # _use_target_line = 1 ONLY when the raw IP itself does not fit.
+        # If the raw IP fits (which it almost always does for IPv4),
+        # show it in the column and skip the ↳ line entirely.
+        local tgt_col
+        local _use_target_line=0
 
-        if (( ${#tgt_full} <= C_TARGET )); then
-            # Full "FQDN (IP)" fits — show it directly, no second line needed
-            tgt_col="$tgt_full"
-            _use_target_line=0
-        elif (( ${#tgt_raw} <= C_TARGET )); then
-            # Raw IP fits but full FQDN+IP string does not — show raw IP in
-            # the column and print the full string on a dedicated line below
+        if (( ${#tgt_raw} <= C_TARGET )); then
+            # Raw IPv4 fits in the column — show it, no ↳ line needed.
+            # The FQDN mapping is already visible in show_stream_summary
+            # and the pre-flight output.  The dashboard column shows
+            # the operational IP address the stream is actually using.
             tgt_col="$tgt_raw"
-            _use_target_line=1
+            _use_target_line=0
         else
-            # Even the raw IP is too long — truncate it and show FQDN below
+            # Raw IP is unusually long (should not happen for IPv4)
             tgt_col="${tgt_raw:0:$(( C_TARGET-1 ))}~"
-            _use_target_line=1
+            _use_target_line=0
         fi
 
         # ── Build and print the TX row ────────────────────────────────────
         local _row_plain
         printf -v _row_plain \
-            " %-*s %-*s %-*s %*s %-*s %-*s %*s %-*s" \
+            "%-*s %-*s %-*s %*s %-*s %-*s %*s %-*s" \
             "$C_SN"     "$sn" \
             "$C_PROTO"  "${S_PROTO[$i]}" \
             "$C_TARGET" "$tgt_col" \
@@ -10548,6 +10545,7 @@ _render_client_frame() {
         if [[ "${S_BIDIR[$i]:-0}" == "1" ]]; then
             bleft "${GREEN}↑ TX${NC} ${_row_plain} ${sc}$(printf '%-*s' "$C_STAT" "$sb")${NC}"
         else
+            # 5 spaces = _PFX_W, keeps all rows left-aligned identically
             bleft "     ${_row_plain} ${sc}$(printf '%-*s' "$C_STAT" "$sb")${NC}"
         fi
 
@@ -10611,29 +10609,30 @@ _render_client_frame() {
         fi
 
         # ── RTT row ───────────────────────────────────────────────────────
-        # Uses bleft() so it is always clipped to the box width.
         local stream_tgt="${S_TARGET[$i]:-}"
         if [[ ! "$stream_tgt" =~ ^127\. && "$stream_tgt" != "::1" ]]; then
-            local rtt_min="${S_RTT_MIN[$i]:-}"
             local rtt_avg="${S_RTT_AVG[$i]:-}"
-            local rtt_max="${S_RTT_MAX[$i]:-}"
-            local rtt_jit="${S_RTT_JITTER[$i]:-}"
-            local rtt_loss="${S_RTT_LOSS[$i]:-}"
             local rtt_cnt="${S_RTT_SAMPLES[$i]:-0}"
 
             if [[ -z "$rtt_avg" || "$rtt_avg" == "---" || "$rtt_cnt" == "0" ]]; then
-                bleft "     ${DIM}  RTT  Waiting for samples...${NC}"
+                # "Waiting" — same 5-space indent as data rows
+                bleft "     ${DIM}RTT  waiting for first sample...${NC}"
             else
-                # Format to fixed widths so columns are stable
-                local f_min f_avg f_max f_jit f_loss f_cnt
-                f_min=$(printf '%7.1f' "$rtt_min"  2>/dev/null || printf '%7s' "$rtt_min")
-                f_avg=$(printf '%7.1f' "$rtt_avg"  2>/dev/null || printf '%7s' "$rtt_avg")
-                f_max=$(printf '%7.1f' "$rtt_max"  2>/dev/null || printf '%7s' "$rtt_max")
-                f_jit=$(printf '%6.1f' "$rtt_jit"  2>/dev/null || printf '%6s' "$rtt_jit")
-                f_loss=$(printf '%4s'  "$rtt_loss")
-                f_cnt=$(printf '%5d'   "$rtt_cnt"  2>/dev/null || printf '%5s' "$rtt_cnt")
+                local rtt_min="${S_RTT_MIN[$i]:-}"
+                local rtt_max="${S_RTT_MAX[$i]:-}"
+                local rtt_jit="${S_RTT_JITTER[$i]:-}"
+                local rtt_loss="${S_RTT_LOSS[$i]:-}"
 
-                # Colour average RTT
+                # Fixed-width fields — 6 chars each
+                local f_min f_avg f_max f_jit f_loss f_cnt
+                f_min=$(printf '%6.1f' "$rtt_min"  2>/dev/null || printf '%6s' "$rtt_min")
+                f_avg=$(printf '%6.1f' "$rtt_avg"  2>/dev/null || printf '%6s' "$rtt_avg")
+                f_max=$(printf '%6.1f' "$rtt_max"  2>/dev/null || printf '%6s' "$rtt_max")
+                f_jit=$(printf '%5.1f' "$rtt_jit"  2>/dev/null || printf '%5s' "$rtt_jit")
+                f_loss=$(printf '%3s'   "$rtt_loss")
+                f_cnt=$(printf '%4d'    "$rtt_cnt"  2>/dev/null || printf '%4s' "$rtt_cnt")
+
+                # Colour coding
                 local avg_col="$GREEN"
                 local avg_int
                 avg_int=$(printf '%.0f' "$rtt_avg" 2>/dev/null || printf '9999')
@@ -10642,7 +10641,6 @@ _render_client_frame() {
                 elif (( avg_int > 10  )); then avg_col="$CYAN"
                 fi
 
-                # Colour loss
                 local loss_col="$GREEN"
                 local loss_num
                 loss_num=$(printf '%s' "$rtt_loss" | tr -d '%')
@@ -10650,17 +10648,17 @@ _render_client_frame() {
                 loss_int=$(printf '%.0f' "${loss_num:-0}" 2>/dev/null || printf '0')
                 (( loss_int > 0 )) && loss_col="$RED"
 
-                # Single bleft() call — bleft handles the right-border padding
+                # Compact format — fits in 78 chars inside the box
+                # "     RTT  min XXXms  avg XXXms  max XXXms  jit XXms  loss X%  (NNN)"
                 bleft "     ${DIM}RTT${NC}"\
-"  ${DIM}min${NC} ${GREEN}${f_min}ms${NC}"\
-"  ${DIM}avg${NC} ${avg_col}${f_avg}ms${NC}"\
-"  ${DIM}max${NC} ${YELLOW}${f_max}ms${NC}"\
-"  ${DIM}jit${NC} ${CYAN}${f_jit}ms${NC}"\
+"  ${DIM}min${NC} ${GREEN}${f_min}${NC}${DIM}ms${NC}"\
+"  ${DIM}avg${NC} ${avg_col}${f_avg}${NC}${DIM}ms${NC}"\
+"  ${DIM}max${NC} ${YELLOW}${f_max}${NC}${DIM}ms${NC}"\
+"  ${DIM}jit${NC} ${CYAN}${f_jit}${NC}${DIM}ms${NC}"\
 "  ${DIM}loss${NC} ${loss_col}${f_loss}${NC}"\
 "  ${DIM}(${f_cnt})${NC}"
             fi
         fi
-
         # ── CWND row ──────────────────────────────────────────────────────
         if [[ "${S_PROTO[$i]:-TCP}" == "TCP" ]] && \
            [[ ! "$stream_tgt" =~ ^127\. && "$stream_tgt" != "::1" ]] && \
@@ -10722,8 +10720,12 @@ _render_client_frame() {
 
         # ── Progress bar ──────────────────────────────────────────────────
         if (( show_bar == 1 )); then
-            local bar_str; bar_str=$(_render_progress_bar "$stream_elapsed" "$dur")
-            local bar_indent=$(( _PFX_W + 1 + C_SN + 1 + C_PROTO + 1 + C_TARGET + 1 + C_PORT + 1 ))
+            local bar_str
+            bar_str=$(_render_progress_bar "$stream_elapsed" "$dur")
+            # Indent = _PFX_W(5) + 1 + C_SN(2) + 1 + C_PROTO(5) + 1
+            #        + C_TARGET(15) + 1 + C_PORT(5) + 1 = 37
+            local bar_indent=$(( _PFX_W + 1 + C_SN + 1 + \
+                                 C_PROTO + 1 + C_TARGET + 1 + C_PORT + 1 ))
             bleft "$(printf '%*s' "$bar_indent" '')${bar_str}"
         fi
 
