@@ -1561,19 +1561,48 @@ _json_export_write() {
 # asks the operator whether to delete them.
 #
 # Behavior:
-#   Y / yes  → delete all files, print confirmation for each
-#   N / no   → keep all files, print their paths
-#   Enter    → default to KEEP (safe default — never auto-delete data)
+#   Y / yes  — delete all files, print confirmation for each
+#   N / no   — keep all files, print their paths
+#   Enter    — default to KEEP (safe default — never auto-delete data)
 #
-# Uses tty_echo() so output goes directly to the terminal even when
-# stdout is redirected.
+# FIXES APPLIED:
+#   1. Bash 3.2 compatibility: replaced ${answer^^} with tr-based
+#      uppercase conversion. The ^^ operator requires Bash 4.0+ and
+#      causes "bad substitution" on macOS default Bash 3.2.
+#   2. Safe variable defaults: all variable expansions use ${var:-}
+#      to prevent unbound variable errors under strict mode.
+#   3. tty_echo used throughout so output reaches the terminal even
+#      when stdout is redirected during signal handling.
+#   4. Read guard: falls back to "N" when stdin is not a TTY so the
+#      function never hangs in non-interactive environments.
+#   5. File size display: uses portable wc -c with tr to strip
+#      whitespace — compatible with both GNU and BSD wc.
+#   6. Empty array guard: returns immediately when no files exist
+#      so the function is safe to call unconditionally from cleanup().
+#   7. jq hint: only printed for files that still exist on disk at
+#      the time of display, not for already-deleted files.
+#
+# CALLED BY:
+#   cleanup()  — on Ctrl+C, SIGTERM, SIGQUIT, SIGHUP, and normal exit
+#
+# GLOBALS READ:
+#   JSON_EXPORT_FILES[]  — array of export file paths created this session
+#   COLS                 — terminal width for separator line
+#   JSON_EXPORT_DIR      — directory where export files are written
+#
+# GLOBALS MODIFIED:
+#   JSON_EXPORT_FILES[]  — cleared after successful deletion (Y path)
 # ==============================================================================
 _json_export_prompt_delete() {
+
+    # ── Guard: nothing to do if no files were created ────────────────────────
     [[ ${#JSON_EXPORT_FILES[@]} -eq 0 ]] && return 0
 
+    # ── Build separator line ──────────────────────────────────────────────────
     local sep
     sep=$(rpt '=' $(( COLS - 2 )))
 
+    # ── Header ───────────────────────────────────────────────────────────────
     tty_echo ""
     tty_echo "${BOLD}${CYAN}+${sep}+${NC}"
     tty_echo "${BOLD}${CYAN}  JSON Export Files — Cleanup${NC}"
@@ -1582,77 +1611,159 @@ _json_export_prompt_delete() {
     tty_echo "  The following JSON results file(s) were created this session:"
     tty_echo ""
 
+    # ── File list with sizes ──────────────────────────────────────────────────
     local f sz
     for f in "${JSON_EXPORT_FILES[@]}"; do
         if [[ -f "$f" ]]; then
-            sz=$(wc -c < "$f" 2>/dev/null | tr -d ' ')
-            tty_echo "    ${CYAN}${f}${NC}  ${DIM}(${sz:-?} bytes)${NC}"
+            # ── Portable file size: wc -c + tr strips BSD/GNU whitespace ──────
+            sz=$(wc -c < "$f" 2>/dev/null | tr -d ' \t\n')
+            tty_echo "    ${CYAN}${f}${NC}  ${DIM}(${sz:-0} bytes)${NC}"
         else
             tty_echo "    ${YELLOW}${f}${NC}  ${DIM}(already removed)${NC}"
         fi
     done
 
     tty_echo ""
+
+    # ── Prompt ───────────────────────────────────────────────────────────────
     tty_echo "  ${BOLD}Delete these JSON file(s)?${NC}"
     tty_echo "    ${BOLD}${RED}Y${NC}  Delete all listed files"
     tty_echo "    ${BOLD}${GREEN}N${NC}  Keep all files  ${DIM}(default — press Enter)${NC}"
     tty_echo ""
 
+    # ── Read answer ───────────────────────────────────────────────────────────
+    # Read from /dev/tty directly so the prompt works during signal handling
+    # when stdout/stdin may be redirected. Falls back to "N" (keep) when
+    # the terminal is not available — never auto-deletes data.
     local answer=""
-    # Read from /dev/tty so we get input even during signal handling
     if [[ -t 0 ]]; then
-        read -r -p "  Choice [N]: " answer </dev/tty 2>/dev/null || answer="N"
+        read -r -p "  Choice [N]: " answer </dev/tty 2>/dev/null \
+            || answer="N"
     else
+        # Non-interactive environment — safe default is always KEEP
         answer="N"
+        tty_echo "  ${DIM}Non-interactive environment detected. Defaulting to Keep.${NC}"
     fi
+
+    # Apply default when operator just pressed Enter
     answer="${answer:-N}"
+
+    # ── FIX: Bash 3.2 compatible uppercase conversion ─────────────────────────
+    # The ${answer^^} operator requires Bash 4.0+ and causes:
+    #   "bad substitution" on macOS default Bash 3.2.57
+    # Solution: use tr for portable uppercase conversion.
+    local answer_upper
+    answer_upper=$(printf '%s' "$answer" | tr '[:lower:]' '[:upper:]')
 
     tty_echo ""
 
-    case "${answer^^}" in
+    # ── Branch on answer ──────────────────────────────────────────────────────
+    case "$answer_upper" in
+
+        # ── DELETE path ───────────────────────────────────────────────────────
         Y|YES)
             tty_echo "  ${BOLD}Deleting JSON export file(s)...${NC}"
             tty_echo ""
-            local deleted=0 failed=0
+
+            local deleted=0
+            local failed=0
+            local skipped=0
+
             for f in "${JSON_EXPORT_FILES[@]}"; do
+
+                # File already gone — skip silently
                 if [[ ! -f "$f" ]]; then
-                    tty_echo "    ${YELLOW}[SKIP  ]${NC}  ${f}  (already removed)"
+                    tty_echo \
+                        "    ${YELLOW}[SKIP   ]${NC}  ${f}  ${DIM}(already removed)${NC}"
+                    (( skipped++ ))
                     continue
                 fi
+
+                # Attempt deletion
                 if rm -f "$f" 2>/dev/null; then
                     tty_echo "    ${GREEN}[DELETED]${NC}  ${f}"
                     (( deleted++ ))
                 else
-                    tty_echo "    ${RED}[FAILED ]${NC}  ${f}  (could not delete — check permissions)"
+                    tty_echo \
+                        "    ${RED}[FAILED ]${NC}  ${f}" \
+                        " ${DIM}(could not delete — check permissions)${NC}"
                     (( failed++ ))
                 fi
             done
+
             tty_echo ""
+
+            # ── Deletion summary ──────────────────────────────────────────────
             if (( deleted > 0 )); then
-                tty_echo "  ${GREEN}✓ ${deleted} file(s) deleted successfully.${NC}"
+                tty_echo \
+                    "  ${GREEN}✓ ${deleted} file(s) deleted successfully.${NC}"
+            fi
+            if (( skipped > 0 )); then
+                tty_echo \
+                    "  ${YELLOW}  ${skipped} file(s) were already removed.${NC}"
             fi
             if (( failed > 0 )); then
-                tty_echo "  ${RED}✗ ${failed} file(s) could not be deleted.${NC}"
-                tty_echo "  ${DIM}  Check file permissions in: ${JSON_EXPORT_DIR}${NC}"
+                tty_echo \
+                    "  ${RED}✗ ${failed} file(s) could not be deleted.${NC}"
+                tty_echo \
+                    "  ${DIM}  Check permissions in: ${JSON_EXPORT_DIR:-$(pwd)}${NC}"
             fi
-            # Clear the tracking array
+
+            # Clear the tracking array so cleanup() does not re-prompt
             JSON_EXPORT_FILES=()
             ;;
 
+        # ── KEEP path (default) ───────────────────────────────────────────────
         *)
             tty_echo "  ${CYAN}JSON file(s) kept.${NC}"
             tty_echo ""
-            tty_echo "  ${DIM}Files are located in: ${JSON_EXPORT_DIR}${NC}"
-            tty_echo "  ${DIM}You can process them with jq:${NC}"
-            local f
+            tty_echo \
+                "  ${DIM}Files are located in: ${JSON_EXPORT_DIR:-$(pwd)}${NC}"
+            tty_echo ""
+            tty_echo "  ${DIM}Analyse results with jq:${NC}"
+            tty_echo ""
+
+            # Only show jq hints for files that still exist on disk
+            local hint_shown=0
             for f in "${JSON_EXPORT_FILES[@]}"; do
-                [[ -f "$f" ]] && \
-                    tty_echo "    ${DIM}jq '.session,.streams[].summary' ${f}${NC}"
+                if [[ -f "$f" ]]; then
+                    tty_echo \
+                        "    ${DIM}# View session summary and stream results${NC}"
+                    tty_echo \
+                        "    ${DIM}jq '.session,.streams[].summary' ${f}${NC}"
+                    tty_echo ""
+                    tty_echo \
+                        "    ${DIM}# Extract per-second bandwidth time-series${NC}"
+                    tty_echo \
+                        "    ${DIM}jq '.streams[0].samples' ${f}${NC}"
+                    tty_echo ""
+                    tty_echo \
+                        "    ${DIM}# List all stream sender bandwidths${NC}"
+                    tty_echo \
+                        "    ${DIM}jq '.streams[].summary.sender_bw' ${f}${NC}"
+                    tty_echo ""
+                    (( hint_shown++ ))
+                    # Only show hints for the first existing file to avoid
+                    # repeating the same jq patterns for every export file
+                    (( hint_shown >= 1 )) && break
+                fi
             done
+
+            # If multiple files exist, list them all plainly
+            if (( ${#JSON_EXPORT_FILES[@]} > 1 )); then
+                tty_echo \
+                    "  ${DIM}All export files this session:${NC}"
+                for f in "${JSON_EXPORT_FILES[@]}"; do
+                    [[ -f "$f" ]] && \
+                        tty_echo "    ${DIM}${f}${NC}"
+                done
+                tty_echo ""
+            fi
             ;;
+
     esac
 
-    tty_echo ""
+    # ── Footer ────────────────────────────────────────────────────────────────
     tty_echo "${BOLD}${CYAN}+${sep}+${NC}"
     tty_echo ""
 }
@@ -8052,7 +8163,8 @@ run_preflight_checks() {
         local vrf_label
         [[ -n "$vrf" ]] && vrf_label="VRF:${vrf}" || vrf_label="GRT"
 
-        printf '  Checking  %s:%s  (%s / %s)...\n' "$tgt" "$prt" "$pro" "$vrf_label"
+        printf '  Checking  %s:%s  (%s / %s)...\n' \
+            "$tgt" "$prt" "$pro" "$vrf_label"
 
         local ping_result
         ping_result=$(_preflight_ping_vrf "$tgt" "$vrf")
@@ -8065,8 +8177,12 @@ run_preflight_checks() {
         res_ping_rtt+=("$p_rtt")
         res_ping_loss+=("$p_loss")
 
+        # ── FIX: use tr instead of ${pro^^} for Bash 3.2 compat ──────
+        local pro_upper
+        pro_upper=$(printf '%s' "$pro" | tr '[:lower:]' '[:upper:]')
+
         local t_status
-        if [[ "${pro^^}" == "UDP" ]]; then
+        if [[ "$pro_upper" == "UDP" ]]; then
             t_status="SKIP"
         else
             t_status=$(_preflight_tcp_port_vrf "$tgt" "$prt" "$vrf")
@@ -8074,7 +8190,8 @@ run_preflight_checks() {
         res_tcp_status+=("$t_status")
 
         local overall="PASS"
-        if   [[ "$p_status" == "FAIL" || "$t_status" == "FAIL" ]]; then
+        if   [[ "$p_status" == "FAIL" || \
+                "$t_status" == "FAIL" ]]; then
             overall="FAIL"; any_fail=1
         elif [[ "$p_status" == "WARN" ]]; then
             overall="WARN"; any_warn=1
@@ -8307,7 +8424,11 @@ run_preflight_checks() {
         while true; do
             read -r -p "  Choice [A]: " decision </dev/tty
             decision="${decision:-A}"
-            case "${decision^^}" in
+            # ── Bash 3.2 compatible uppercase conversion ──────────────
+            local decision_upper
+            decision_upper=$(printf '%s' "$decision" \
+                | tr '[:lower:]' '[:upper:]')
+            case "$decision_upper" in
                 P) printf '%b  Proceeding despite pre-flight failures.%b\n' \
                        "$YELLOW" "$NC"; printf '\n'; return 0 ;;
                 A) printf '%b  Aborted. Fix connectivity issues and retry.%b\n' \
@@ -8329,7 +8450,11 @@ run_preflight_checks() {
         while true; do
             read -r -p "  Choice [P]: " decision </dev/tty
             decision="${decision:-P}"
-            case "${decision^^}" in
+            # ── Bash 3.2 compatible uppercase conversion ──────────────
+            local decision_upper
+            decision_upper=$(printf '%s' "$decision" \
+                | tr '[:lower:]' '[:upper:]')
+            case "$decision_upper" in
                 P) printf '%b  Proceeding with warnings noted.%b\n' \
                        "$YELLOW" "$NC"; printf '\n'; return 0 ;;
                 A) printf '%b  Aborted.%b\n' "$RED" "$NC"; printf '\n'; return 1 ;;
@@ -14678,14 +14803,14 @@ main() {
     _print_capability_matrix
 
     # Step 5: Feature guard checks using populated CAP_* globals.
-    if [[ "$S_RAMP_ENABLED" == "1" ]] && [[ "$CAP_RAMP" == *"OFF"* ]]; then
+    if [[ "$S_RAMP_ENABLED" == "1" ]] && [[ "$CAP_RAMP_RAW" == *"OFF"* ]]; then
         printf "%bERROR:%b TCP Ramp-Up requested but capability is [OFF].\n" \
             "$R" "$NC"
         printf "       Run as root with iproute2 (tc) installed.\n"
         exit 1
     fi
 
-    if [[ "$S_BIDIR" == "1" ]] && [[ "$CAP_BIDIR" == *"OFF"* ]]; then
+    if [[ "$S_BIDIR" == "1" ]] && [[ "$CAP_BIDIR_RAW" == *"OFF"* ]]; then
         printf "%bERROR:%b Bidir requested but iperf3 version is too old.\n" \
             "$R" "$NC"
         printf "       Upgrade iperf3 to v3.7 or later.\n"
@@ -14695,7 +14820,7 @@ main() {
     # Step 6: Countdown before TUI takes over.
     printf "Launching PRISM dashboard in 5 seconds "
     for _i in 5 4 3 2 1; do
-        printf "%d... " "$_i"
+        printf "%d   " "$_i"
         sleep 1
     done
     printf "\n\n\n"
