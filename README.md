@@ -2,7 +2,7 @@
 
 > Enterprise-grade multi-stream traffic orchestration with a live QoS dashboard.
 
-[![Version](https://img.shields.io/badge/version-8.3.8-blue.svg)](https://github.com/waqasdaar/prism)
+[![Version](https://img.shields.io/badge/version-8.3.9-blue.svg)](https://github.com/waqasdaar/prism)
 [![Shell](https://img.shields.io/badge/shell-Bash%203.2%2B-green.svg)](https://www.gnu.org/software/bash/)
 [![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20macOS-lightgrey.svg)](https://github.com/waqasdaar/prism)
 [![License](https://img.shields.io/badge/license-MIT-orange.svg)](LICENSE)
@@ -117,6 +117,9 @@ and stream health in real time.
 | Network impairment | None | `tc netem` delay / jitter / loss |
 | DSCP verification | None | Live tcpdump packet capture overlay |
 | Theme support | None | Dark / Light / Mono terminal themes |
+
+<br><br>
+<img width="1672" height="941" alt="PRISM-UseCases" src="https://github.com/user-attachments/assets/a83f9057-cf3f-4902-b71b-c51ad1d686d1" />
 
 ---
 
