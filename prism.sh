@@ -6097,21 +6097,19 @@ configure_server_streams() {
     SERVER_COUNT="$num"
 }
 
-
 # ==============================================================================
 # show_stream_summary  <mode>
 #
-# ALIGNMENT FIXES:
-#   1. C_TGT is now DYNAMIC — computed from the longest target display string
-#      across all streams so the column is always wide enough without overflow.
-#   2. The separator line width is recomputed from the actual column widths.
-#   3. The "resolved:" annotation is suppressed when the full FQDN+IP string
-#      already fits in the Target column (no truncation needed).
-#   4. A hard cap prevents C_TGT from making the row wider than the terminal.
-#   5. When the full display string cannot fit even in the dynamic column,
-#      a dedicated "↳ FQDN (IP)" continuation line is printed instead of
-#      truncating with ~.
+# ALIGNMENT FIXES v2:
+#   1. C_TGT is DYNAMIC — computed from the longest target display string.
+#   2. The full "FQDN (IP)" string always fits with zero truncation.
+#   3. If the terminal is too narrow for even the dynamic column, a
+#      dedicated "↳ FQDN (IP)" continuation line is used instead.
+#   4. The "resolved:" annotation is suppressed when the full string already
+#      appears in the Target column to avoid duplicating information.
+#   5. The separator line width tracks the dynamic C_TGT exactly.
 # ==============================================================================
+
 show_stream_summary() {
     local mode="${1:-client}"
 
@@ -6126,37 +6124,25 @@ show_stream_summary() {
     if [[ "$mode" == "client" ]]; then
 
         # ── Fixed column widths ─────────────────────────────────────────
-        local C_SN=3       # stream number
-        local C_PROTO=5    # protocol
-        local C_PORT=6     # port
-        local C_BW=11      # bandwidth
-        local C_DUR=5      # duration
-        local C_DSCP=5     # DSCP name
-        local C_VRF=6      # VRF
+        local C_SN=3
+        local C_PROTO=5
+        local C_PORT=6
+        local C_BW=11
+        local C_DUR=5
+        local C_DSCP=5
+        local C_VRF=6
 
         # ── Dynamic C_TGT ───────────────────────────────────────────────
-        # Start with the header label width as the minimum.
-        local C_TGT=6   # minimum width = length of "Target"
-
-        # Measure the longest target display string across all streams
+        # Size the Target column to exactly fit the longest display string.
+        # S_TARGET_DISPLAY[$i] holds "FQDN (IP)" when an FQDN was entered,
+        # otherwise S_TARGET[$i] holds the raw IPv4.
+        # We never truncate this column — the table simply widens to fit.
+        local C_TGT=6  # minimum = length of header word "Target"
         local i
         for (( i=0; i<STREAM_COUNT; i++ )); do
-            local _tgt_candidate="${S_TARGET_DISPLAY[$i]:-${S_TARGET[$i]:-?}}"
-            if (( ${#_tgt_candidate} > C_TGT )); then
-                C_TGT=${#_tgt_candidate}
-            fi
+            local _cand="${S_TARGET_DISPLAY[$i]:-${S_TARGET[$i]:-?}}"
+            (( ${#_cand} > C_TGT )) && C_TGT=${#_cand}
         done
-
-        # ── Hard cap: prevent row overflow ──────────────────────────────
-        # Total row width = 2(indent) + C_SN+2 + C_PROTO+2 + C_TGT+2 +
-        #                   C_PORT+2 + C_BW+2 + C_DUR+2 + C_DSCP+2 + C_VRF
-        # Solve for max C_TGT:
-        local _fixed_cols=$(( C_SN + 2 + C_PROTO + 2 + C_PORT + 2 + \
-                              C_BW + 2 + C_DUR + 2 + C_DSCP + 2 + C_VRF ))
-        # Available for target = COLS - 2(indent) - _fixed_cols
-        local _max_tgt=$(( COLS - 2 - _fixed_cols ))
-        (( _max_tgt < 20 )) && _max_tgt=20
-        (( C_TGT > _max_tgt )) && C_TGT=$_max_tgt
 
         # ── Column header ───────────────────────────────────────────────
         printf '  %-*s  %-*s  %-*s  %*s  %-*s  %-*s  %-*s  %-*s\n' \
@@ -6179,77 +6165,49 @@ show_stream_summary() {
         for (( i=0; i<STREAM_COUNT; i++ )); do
             local sn=$(( i + 1 ))
 
-            # Duration display
+            # Duration
             local dd
             (( S_DURATION[$i] == 0 )) && dd="inf" || dd="${S_DURATION[$i]}s"
 
-            # VRF display
+            # VRF — truncate only this narrow column
             local vrf_disp="${S_VRF[$i]:-GRT}"
             [[ "$OS_TYPE" == "macos" ]] && vrf_disp="N/A"
             if (( ${#vrf_disp} > C_VRF )); then
                 vrf_disp="${vrf_disp:0:$(( C_VRF - 1 ))}~"
             fi
 
-            # Bandwidth display
+            # Bandwidth
             local bw_show="${S_BW[$i]:-unlimited}"
             if (( ${#bw_show} > C_BW )); then
                 bw_show="${bw_show:0:$(( C_BW - 1 ))}~"
             fi
 
-            # DSCP display
+            # DSCP
             local dscp_show="${S_DSCP_NAME[$i]:-none}"
             if (( ${#dscp_show} > C_DSCP )); then
                 dscp_show="${dscp_show:0:$(( C_DSCP - 1 ))}~"
             fi
 
-            # ── Target: fits in C_TGT? ──────────────────────────────────
-            # The raw display string (e.g. "iperf.he.net (216.218.207.42)")
+            # ── Target: ALWAYS show the full display string ──────────────
+            # C_TGT was sized to fit this string exactly so no truncation
+            # is ever needed here.  We print the full "FQDN (IP)" string
+            # directly in the column.
             local tgt_full="${S_TARGET_DISPLAY[$i]:-${S_TARGET[$i]:-?}}"
-            local tgt_col   # what goes in the table column
-            local need_cont=0  # whether a continuation line is needed
 
-            if (( ${#tgt_full} <= C_TGT )); then
-                # Full string fits — use it directly, no continuation needed
-                tgt_col="$tgt_full"
-                need_cont=0
-            else
-                # Even the dynamic column is not wide enough.
-                # Show a placeholder in the column and print the full
-                # string on a dedicated continuation line below.
-                tgt_col="$(rpt '─' "$C_TGT")"
-                need_cont=1
-            fi
-
-            # ── Main row ─────────────────────────────────────────────────
+            # ── Main data row ────────────────────────────────────────────
             printf '  %-*s  %-*s  %-*s  %*s  %-*s  %-*s  %-*s  %-*s\n' \
                 "$C_SN"    "$sn" \
                 "$C_PROTO" "${S_PROTO[$i]}" \
-                "$C_TGT"   "$tgt_col" \
+                "$C_TGT"   "$tgt_full" \
                 "$C_PORT"  "${S_PORT[$i]}" \
                 "$C_BW"    "$bw_show" \
                 "$C_DUR"   "$dd" \
                 "$C_DSCP"  "$dscp_show" \
                 "$C_VRF"   "$vrf_disp"
 
-            # ── Continuation line (only when target did not fit) ─────────
-            # Indented to align under the Target column.
-            # Layout: 2(indent) + C_SN + 2 + C_PROTO + 2 = target_indent
-            if (( need_cont == 1 )); then
-                local _tgt_indent=$(( 2 + C_SN + 2 + C_PROTO + 2 ))
-                local _tgt_avail=$(( COLS - _tgt_indent - 2 ))
-                (( _tgt_avail < 20 )) && _tgt_avail=20
+            # ── Annotations below the main row ───────────────────────────
 
-                local cont_str="$tgt_full"
-                # Last-resort truncation only if terminal is extremely narrow
-                if (( ${#cont_str} > _tgt_avail )); then
-                    cont_str="${cont_str:0:$(( _tgt_avail - 1 ))}~"
-                fi
-                printf '%*s%b↳ %s%b\n' \
-                    "$_tgt_indent" "" \
-                    "$CYAN" "$cont_str" "$NC"
-            fi
-
-            # ── TCP / flag / netem annotations ──────────────────────────
+            # TCP options / flags / netem
             local ex=""
             [[ -n "${S_CCA[$i]}"    ]] && ex+=" CCA:${S_CCA[$i]}"
             [[ -n "${S_WINDOW[$i]}" ]] && ex+=" Win:${S_WINDOW[$i]}"
@@ -6266,7 +6224,7 @@ show_stream_summary() {
             [[ -n "$ex" ]] && \
                 printf '%b    %s%b\n' "$CYAN" "$ex" "$NC"
 
-            # ── Ramp profile annotation ──────────────────────────────────
+            # Ramp profile
             if [[ "${S_RAMP_ENABLED[$i]:-0}" == "1" ]]; then
                 printf '%b    ramp: +%ds →  hold  %ds ←  (target: %s)%b\n' \
                     "$CYAN" \
@@ -6276,39 +6234,37 @@ show_stream_summary() {
                     "$NC"
             fi
 
-            # ── FQDN resolved annotation ─────────────────────────────────
-            # Only printed when:
-            #   (a) a display name exists (FQDN was resolved), AND
-            #   (b) the display name is different from the raw IP, AND
-            #   (c) we did NOT already print a continuation line above
-            #       (to avoid showing the same info twice)
-            if (( need_cont == 0 )) && \
-               [[ -n "${S_TARGET_DISPLAY[$i]:-}" ]] && \
+            # ── "resolved:" annotation ───────────────────────────────────
+            # Only printed when an FQDN was resolved (display string differs
+            # from the raw IPv4) to confirm which IP the FQDN maps to.
+            # Format:  "    resolved: FQDN → IP"
+            if [[ -n "${S_TARGET_DISPLAY[$i]:-}" ]] && \
                [[ "${S_TARGET_DISPLAY[$i]}" != "${S_TARGET[$i]:-}" ]]; then
+                # Extract the hostname part by stripping " (IP)" suffix
+                local _fqdn_only="${S_TARGET_DISPLAY[$i]%% (*}"
                 printf '%b    resolved: %s → %s%b\n' \
                     "$DIM" \
-                    "${S_TARGET_DISPLAY[$i]%% (*}" \
+                    "$_fqdn_only" \
                     "${S_TARGET[$i]}" \
                     "$NC"
             fi
+
         done
 
         # ── Footer separator ─────────────────────────────────────────────
         printf '  %s\n' "$(rpt '-' $_sep_len)"
 
     # ------------------------------------------------------------------
-    # SERVER MODE
+    # SERVER MODE  (unchanged)
     # ------------------------------------------------------------------
     else
 
-        # ── Column widths ────────────────────────────────────────────────
         local C_SN=3
         local C_PORT=7
         local C_BIND=18
         local C_VRF=12
         local C_ONEOFF=6
 
-        # ── Column header ────────────────────────────────────────────────
         printf '  %-*s  %*s  %-*s  %-*s  %-*s\n' \
             "$C_SN"     "#" \
             "$C_PORT"   "Port" \
@@ -6320,7 +6276,6 @@ show_stream_summary() {
                            C_VRF + 2 + C_ONEOFF ))
         printf '  %s\n' "$(rpt '-' $_srv_sep)"
 
-        # ── Data rows ────────────────────────────────────────────────────
         local i
         for (( i=0; i<SERVER_COUNT; i++ )); do
             local sn=$(( i + 1 ))
